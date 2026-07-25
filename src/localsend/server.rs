@@ -1,3 +1,5 @@
+//! LocalSend HTTPS server implementation for Axum handling v2 API endpoints.
+
 use crate::events::{AppEvent, IncomingTransferRequest};
 use crate::localsend::protocol::{
     DeviceType, FileDto, InfoDto, LOCALSEND_DEFAULT_PORT, PROTOCOL_VERSION, Peer,
@@ -26,6 +28,7 @@ use tokio_rustls::TlsAcceptor;
 use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
+/// Shared application state injected into Axum web handlers.
 #[derive(Clone)]
 pub struct ServerState {
     pub alias: String,
@@ -35,12 +38,14 @@ pub struct ServerState {
     pub active_sessions: Arc<Mutex<HashMap<String, ActiveSession>>>,
 }
 
+/// Information tracking an active file upload/download transfer session.
 #[derive(Clone)]
 pub struct ActiveSession {
     pub files: HashMap<String, (String, u64)>, // file_id -> (file_name, size)
     pub tokens: HashMap<String, String>,       // file_id -> token
 }
 
+/// Query parameters passed to `/api/localsend/v2/upload`.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UploadQuery {
@@ -49,6 +54,7 @@ pub struct UploadQuery {
     pub token: String,
 }
 
+/// Query parameters passed to `/api/localsend/v2/download`.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DownloadQuery {
@@ -57,6 +63,7 @@ pub struct DownloadQuery {
     pub token: Option<String>,
 }
 
+/// Starts the LocalSend HTTPS server on the specified port with TLS support.
 pub async fn start_server(
     alias: String,
     fingerprint: String,
@@ -89,7 +96,7 @@ pub async fn start_server(
         .route("/api/localsend/v2/cancel", post(handle_cancel))
         .with_state(state);
 
-    let listener = TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
+    let listener = TcpListener::bind(format!("0.0.0.0:{port}")).await?;
     let tls_acceptor = TlsAcceptor::from(server_config);
 
     loop {
@@ -144,7 +151,7 @@ async fn handle_register(
     let payload: RegisterDto = match serde_json::from_str(&body) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("Failed to parse HTTP register payload: {}", e);
+            eprintln!("Failed to parse HTTP register payload: {e}");
             return (
                 StatusCode::OK,
                 Json(InfoDto {
@@ -163,12 +170,12 @@ async fn handle_register(
     let peer_port = payload.port.unwrap_or(LOCALSEND_DEFAULT_PORT);
     let peer_protocol = payload.protocol.unwrap_or_else(|| "https".to_string());
     let alias = if payload.alias.is_empty() {
-        format!("Device ({})", peer_ip)
+        format!("Device ({peer_ip})")
     } else {
         payload.alias
     };
     let fingerprint = if payload.fingerprint.is_empty() {
-        format!("{}:{}", peer_ip, peer_port)
+        format!("{peer_ip}:{peer_port}")
     } else {
         payload.fingerprint
     };
@@ -207,7 +214,7 @@ async fn handle_prepare_upload(
     let json_val: serde_json::Value = match serde_json::from_str(&body) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("Failed to parse prepare-upload body: {}", e);
+            eprintln!("Failed to parse prepare-upload body: {e}");
             return (StatusCode::BAD_REQUEST, "Invalid prepare-upload payload").into_response();
         }
     };
@@ -248,7 +255,7 @@ async fn handle_prepare_upload(
         .and_then(|f| f.as_str())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
-        .unwrap_or_else(|| format!("{}:{}", peer_ip, peer_port));
+        .unwrap_or_else(|| format!("{peer_ip}:{peer_port}"));
 
     let peer = Peer {
         alias: peer_alias,
@@ -304,7 +311,7 @@ async fn handle_prepare_upload(
                     .get("id")
                     .and_then(|i| i.as_str())
                     .map(|s| s.to_string())
-                    .unwrap_or_else(|| format!("{}", idx));
+                    .unwrap_or_else(|| format!("{idx}"));
                 let fname = fval
                     .get("fileName")
                     .or_else(|| fval.get("file_name"))
@@ -407,7 +414,7 @@ async fn handle_upload(
         Err(_) => {
             let _ = state.event_tx.send(AppEvent::TransferFailed {
                 session_id: query.session_id.clone(),
-                error: format!("Failed creating file {}", file_name),
+                error: format!("Failed creating file {file_name}"),
             });
             return StatusCode::INTERNAL_SERVER_ERROR;
         }
@@ -438,7 +445,7 @@ async fn handle_upload(
                 let _ = tokio::fs::remove_file(&save_path).await;
                 let _ = state.event_tx.send(AppEvent::TransferFailed {
                     session_id: query.session_id.clone(),
-                    error: format!("Upload stream timed out or cancelled for {}", file_name),
+                    error: format!("Upload stream timed out or cancelled for {file_name}"),
                 });
                 return StatusCode::BAD_REQUEST;
             }
@@ -449,7 +456,7 @@ async fn handle_upload(
                 if file.write_all(&chunk).await.is_err() {
                     let _ = state.event_tx.send(AppEvent::TransferFailed {
                         session_id: query.session_id.clone(),
-                        error: format!("Failed writing file {}", file_name),
+                        error: format!("Failed writing file {file_name}"),
                     });
                     return StatusCode::INTERNAL_SERVER_ERROR;
                 }
@@ -469,9 +476,10 @@ async fn handle_upload(
                     .lock()
                     .unwrap()
                     .remove(&query.session_id);
+                let _ = tokio::fs::remove_file(&save_path).await;
                 let _ = state.event_tx.send(AppEvent::TransferFailed {
                     session_id: query.session_id.clone(),
-                    error: format!("Upload stream interrupted or cancelled for {}", file_name),
+                    error: format!("Upload stream interrupted or cancelled for {file_name}"),
                 });
                 return StatusCode::BAD_REQUEST;
             }
@@ -488,8 +496,7 @@ async fn handle_upload(
         let _ = state.event_tx.send(AppEvent::TransferFailed {
             session_id: query.session_id,
             error: format!(
-                "Transfer cancelled by sender (received {}/{} bytes)",
-                bytes_transferred, total_size
+                "Transfer cancelled by sender (received {bytes_transferred}/{total_size} bytes)"
             ),
         });
         return StatusCode::BAD_REQUEST;
@@ -513,7 +520,7 @@ async fn handle_upload(
     if all_completed {
         let _ = state.event_tx.send(AppEvent::TransferCompleted {
             session_id: query.session_id,
-            message: format!("Received {}", file_name),
+            message: format!("Received {file_name}"),
         });
     }
 
@@ -557,7 +564,7 @@ async fn handle_download(
         (header::CONTENT_TYPE, "application/octet-stream".to_string()),
         (
             header::CONTENT_DISPOSITION,
-            format!("attachment; filename=\"{}\"", file_name),
+            format!("attachment; filename=\"{file_name}\""),
         ),
     ];
 
@@ -634,7 +641,7 @@ async fn handle_prepare_download(
             };
             if metadata.is_file() {
                 let file_name = entry.file_name().to_string_lossy().to_string();
-                let file_id = format!("file-{}", count);
+                let file_id = format!("file-{count}");
                 let size = metadata.len();
                 session_files.insert(file_id.clone(), (file_name.clone(), size));
 

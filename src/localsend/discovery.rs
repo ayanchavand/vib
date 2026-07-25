@@ -1,3 +1,5 @@
+//! Multicast UDP peer discovery engine for LocalSend.
+
 use crate::events::AppEvent;
 use crate::localsend::protocol::{
     DeviceType, LOCALSEND_DEFAULT_PORT, LOCALSEND_MULTICAST_ADDR, PROTOCOL_VERSION, Peer,
@@ -11,6 +13,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::time::{self, Duration};
 
+/// Handles multicast UDP peer announcements and incoming registration responses.
 pub struct DiscoveryEngine {
     alias: String,
     fingerprint: String,
@@ -20,13 +23,13 @@ pub struct DiscoveryEngine {
 }
 
 impl DiscoveryEngine {
+    /// Creates a new `DiscoveryEngine` configured with local device metadata.
     pub fn new(
         alias: String,
         fingerprint: String,
         port: u16,
         event_tx: UnboundedSender<AppEvent>,
     ) -> Self {
-        // LocalSend v2 protocol uses self-signed TLS certificates for P2P transfers
         let http_client = Client::builder()
             .danger_accept_invalid_certs(true)
             .build()
@@ -41,10 +44,10 @@ impl DiscoveryEngine {
         }
     }
 
+    /// Starts the background UDP discovery listener and announcement ticker.
     pub async fn start(self: Arc<Self>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let bind_addr: SocketAddr = format!("0.0.0.0:{}", self.port).parse()?;
 
-        // Configure socket with SO_REUSEADDR
         let socket2 = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
         socket2.set_reuse_address(true)?;
         socket2.set_nonblocking(true)?;
@@ -54,10 +57,8 @@ impl DiscoveryEngine {
         let std_socket: std::net::UdpSocket = socket2.into();
         let multicast_addr: Ipv4Addr = LOCALSEND_MULTICAST_ADDR.parse()?;
 
-        // Join multicast on unspecified interface
         let _ = std_socket.join_multicast_v4(&multicast_addr, &Ipv4Addr::UNSPECIFIED);
 
-        // Join multicast explicitly on ALL active local IPv4 interface IPs (e.g. wlan0 10.199.210.67, eth0)
         let local_ips = get_local_v4_ips();
         for ip in &local_ips {
             let _ = std_socket.join_multicast_v4(&multicast_addr, ip);
@@ -65,7 +66,6 @@ impl DiscoveryEngine {
 
         let socket = Arc::new(UdpSocket::from_std(std_socket)?);
 
-        // Spawn periodic announcement task
         let engine_clone = self.clone();
         let socket_send = socket.clone();
         tokio::spawn(async move {
@@ -73,12 +73,11 @@ impl DiscoveryEngine {
             loop {
                 interval.tick().await;
                 if let Err(e) = engine_clone.announce(&socket_send).await {
-                    eprintln!("Discovery announce error: {}", e);
+                    eprintln!("Discovery announce error: {e}");
                 }
             }
         });
 
-        // Spawn UDP listener task
         let mut buf = [0u8; 65535];
         loop {
             match socket.recv_from(&mut buf).await {
@@ -106,7 +105,7 @@ impl DiscoveryEngine {
                             alias,
                             version: msg.version.clone(),
                             device_model: msg.device_model.clone(),
-                            device_type: msg.device_type.clone(),
+                            device_type: msg.device_type,
                             fingerprint,
                             ip: src_addr.ip().to_string(),
                             port: peer_port,
@@ -114,7 +113,6 @@ impl DiscoveryEngine {
                         };
                         let _ = self.event_tx.send(AppEvent::PeerDiscovered(peer));
 
-                        // Spec Section 3.1: Reply via HTTP POST /api/localsend/v2/register
                         if msg.announce == Some(true) {
                             let engine_reply = self.clone();
                             let target_ip = src_addr.ip().to_string();
@@ -127,13 +125,14 @@ impl DiscoveryEngine {
                     }
                 }
                 Err(e) => {
-                    eprintln!("UDP receive error: {}", e);
+                    eprintln!("UDP receive error: {e}");
                     time::sleep(Duration::from_millis(500)).await;
                 }
             }
         }
     }
 
+    /// Broadcasts an announcement payload via multicast UDP and local subnet broadcast.
     pub async fn announce(
         &self,
         socket: &UdpSocket,
@@ -153,20 +152,19 @@ impl DiscoveryEngine {
         let json_bytes = serde_json::to_vec(&register_msg)?;
 
         let multicast_target: SocketAddr =
-            format!("{}:{}", LOCALSEND_MULTICAST_ADDR, LOCALSEND_DEFAULT_PORT).parse()?;
+            format!("{LOCALSEND_MULTICAST_ADDR}:{LOCALSEND_DEFAULT_PORT}").parse()?;
         let broadcast_target: SocketAddr =
-            format!("255.255.255.255:{}", LOCALSEND_DEFAULT_PORT).parse()?;
+            format!("255.255.255.255:{LOCALSEND_DEFAULT_PORT}").parse()?;
 
         let _ = socket.send_to(&json_bytes, multicast_target).await;
         let _ = socket.send_to(&json_bytes, broadcast_target).await;
 
-        // Also broadcast out on subnet directed broadcast for each local IPv4 interface (e.g. 10.199.210.255)
         let local_ips = get_local_v4_ips();
         for ip in local_ips {
             let octets = ip.octets();
             let subnet_bcast: SocketAddr = format!(
-                "{}.{}.{}.255:{}",
-                octets[0], octets[1], octets[2], LOCALSEND_DEFAULT_PORT
+                "{}.{}.{}.255:{LOCALSEND_DEFAULT_PORT}",
+                octets[0], octets[1], octets[2]
             )
             .parse()
             .unwrap_or(broadcast_target);
@@ -176,6 +174,7 @@ impl DiscoveryEngine {
         Ok(())
     }
 
+    /// Sends a unicast HTTP POST registration reply to a discovered peer.
     pub async fn reply_register(&self, target_ip: &str, target_port: u16, target_protocol: &str) {
         let register_msg = RegisterDto {
             alias: self.alias.clone(),
@@ -189,14 +188,13 @@ impl DiscoveryEngine {
             announce: Some(false),
         };
 
-        let url = format!(
-            "{}://{}:{}/api/localsend/v2/register",
-            target_protocol, target_ip, target_port
-        );
+        let url =
+            format!("{target_protocol}://{target_ip}:{target_port}/api/localsend/v2/register");
         let _ = self.http_client.post(&url).json(&register_msg).send().await;
     }
 }
 
+/// Retrieves all non-loopback local IPv4 network interface addresses.
 #[cfg(unix)]
 pub fn get_local_v4_ips() -> Vec<Ipv4Addr> {
     let mut ips = Vec::new();
@@ -222,6 +220,7 @@ pub fn get_local_v4_ips() -> Vec<Ipv4Addr> {
     ips
 }
 
+/// Fallback for non-Unix environments to discover local IPv4 address.
 #[cfg(not(unix))]
 pub fn get_local_v4_ips() -> Vec<Ipv4Addr> {
     let mut ips = Vec::new();

@@ -1,3 +1,5 @@
+//! LocalSend HTTP/HTTPS client for initiating file transfers to remote peers.
+
 use crate::events::AppEvent;
 use crate::localsend::protocol::{
     DeviceType, FileDto, PROTOCOL_VERSION, Peer, PrepareUploadReqDto, PrepareUploadRespDto,
@@ -11,6 +13,7 @@ use tokio::fs::File;
 use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
+/// Client responsible for executing file upload sessions to remote LocalSend peers.
 pub struct LocalSendClient {
     client: Client,
     alias: String,
@@ -19,6 +22,7 @@ pub struct LocalSendClient {
 }
 
 impl LocalSendClient {
+    /// Creates a new `LocalSendClient` instance configured with local device credentials.
     pub fn new(alias: String, fingerprint: String, port: u16) -> Self {
         let client = Client::builder()
             .danger_accept_invalid_certs(true)
@@ -33,6 +37,7 @@ impl LocalSendClient {
         }
     }
 
+    /// Uploads specified files to a target `Peer` device, emitting progress events.
     pub async fn send_files(
         &self,
         peer: Peer,
@@ -53,7 +58,7 @@ impl LocalSendClient {
                 .file_name()
                 .unwrap_or_default()
                 .to_string_lossy()
-                .to_string();
+                .into_owned();
 
             let file_id = Uuid::new_v4().to_string();
 
@@ -93,7 +98,7 @@ impl LocalSendClient {
             files: file_dto_map.clone(),
         };
 
-        let prepare_url = format!("{}/api/localsend/v2/prepare-upload", base_url);
+        let prepare_url = format!("{base_url}/api/localsend/v2/prepare-upload");
         let res = match self
             .client
             .post(&prepare_url)
@@ -105,7 +110,7 @@ impl LocalSendClient {
             Err(e) => {
                 let _ = event_tx.send(AppEvent::TransferFailed {
                     session_id: "unknown".to_string(),
-                    error: format!("Failed to connect to peer: {}", e),
+                    error: format!("Failed to connect to peer: {e}"),
                 });
                 return;
             }
@@ -114,7 +119,10 @@ impl LocalSendClient {
         if res.status() == reqwest::StatusCode::FORBIDDEN {
             let _ = event_tx.send(AppEvent::TransferFailed {
                 session_id: "unknown".to_string(),
-                error: format!("Transfer cancelled or declined by receiver ({})", peer.alias),
+                error: format!(
+                    "Transfer cancelled or declined by receiver ({})",
+                    peer.alias
+                ),
             });
             return;
         }
@@ -124,7 +132,7 @@ impl LocalSendClient {
             Err(e) => {
                 let _ = event_tx.send(AppEvent::TransferFailed {
                     session_id: "unknown".to_string(),
-                    error: format!("Transfer rejected or cancelled by peer: {}", e),
+                    error: format!("Transfer rejected or cancelled by peer: {e}"),
                 });
                 return;
             }
@@ -150,15 +158,14 @@ impl LocalSendClient {
                 Err(e) => {
                     let _ = event_tx.send(AppEvent::TransferFailed {
                         session_id: session_id.clone(),
-                        error: format!("Failed to open file {:?}: {}", path, e),
+                        error: format!("Failed to open file {path:?}: {e}"),
                     });
                     continue;
                 }
             };
 
             let upload_url = format!(
-                "{}/api/localsend/v2/upload?sessionId={}&fileId={}&token={}",
-                base_url, session_id, file_id, token
+                "{base_url}/api/localsend/v2/upload?sessionId={session_id}&fileId={file_id}&token={token}"
             );
 
             let event_tx_clone = event_tx.clone();
@@ -174,7 +181,7 @@ impl LocalSendClient {
                     file_bytes_sent += bytes.len() as u64;
                     let _ = event_tx_clone.send(AppEvent::TransferProgress {
                         session_id: session_id_clone.clone(),
-                        file_id: format!("{} to {}", file_name, peer_alias),
+                        file_id: format!("{file_name} to {peer_alias}"),
                         bytes_transferred: initial_cumulative + file_bytes_sent,
                         total_bytes: total_size_all,
                         is_upload: true,
@@ -189,7 +196,7 @@ impl LocalSendClient {
                 Err(e) => {
                     let _ = event_tx.send(AppEvent::TransferFailed {
                         session_id: session_id.clone(),
-                        error: format!("Upload cancelled or failed: {}", e),
+                        error: format!("Upload cancelled or failed: {e}"),
                     });
                     return;
                 }

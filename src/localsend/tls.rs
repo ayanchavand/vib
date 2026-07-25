@@ -1,12 +1,16 @@
+//! TLS self-signed certificate generation using `rcgen` and `rustls`.
+
 use rcgen::{CertificateParams, KeyPair};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
+/// Container holding rustls server configuration and calculated SHA-256 fingerprint.
 pub struct TlsConfig {
     pub server_config: Arc<rustls::ServerConfig>,
     pub fingerprint: String,
 }
 
+/// Generates an in-memory self-signed certificate for LocalSend HTTPS communication.
 pub fn generate_self_signed_cert(
     alias: &str,
 ) -> Result<TlsConfig, Box<dyn std::error::Error + Send + Sync>> {

@@ -1,7 +1,10 @@
+//! LocalSend v2 Protocol DTOs, data structures, and network constants.
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// Device classification types supported by the LocalSend protocol.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum DeviceType {
     Mobile,
@@ -13,7 +16,8 @@ pub enum DeviceType {
     Unknown,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Registration payload exchanged over Multicast UDP or HTTP `/api/localsend/v2/register`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct RegisterDto {
     #[serde(default)]
@@ -30,7 +34,8 @@ pub struct RegisterDto {
     pub announce: Option<bool>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Device info response for `/api/localsend/v2/info`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct InfoDto {
     pub alias: String,
@@ -41,7 +46,8 @@ pub struct InfoDto {
     pub download: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Metadata describing a single file in a transfer session.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct FileDto {
     #[serde(default)]
@@ -56,6 +62,7 @@ pub struct FileDto {
     pub metadata: Option<serde_json::Value>,
 }
 
+/// Request payload sent to `/api/localsend/v2/prepare-upload`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PrepareUploadReqDto {
@@ -63,6 +70,7 @@ pub struct PrepareUploadReqDto {
     pub files: HashMap<String, FileDto>,
 }
 
+/// Response payload returned by `/api/localsend/v2/prepare-upload`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PrepareUploadRespDto {
@@ -70,7 +78,8 @@ pub struct PrepareUploadRespDto {
     pub files: HashMap<String, String>,
 }
 
-#[derive(Debug, Clone)]
+/// Represents a discovered LocalSend peer device on the network.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Peer {
     pub alias: String,
     pub version: String,
@@ -82,6 +91,9 @@ pub struct Peer {
     pub protocol: String,
 }
 
+/// LocalSend multicast IPv4 address.
 pub const LOCALSEND_MULTICAST_ADDR: &str = "224.0.0.167";
+/// Default LocalSend UDP/HTTPS port.
 pub const LOCALSEND_DEFAULT_PORT: u16 = 53317;
+/// LocalSend protocol version string.
 pub const PROTOCOL_VERSION: &str = "2.1";
