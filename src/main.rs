@@ -1,3 +1,5 @@
+//! `vib` - Terminal file manager with built-in LocalSend P2P file transfers.
+
 use color_eyre::Result;
 use crossterm::event::EventStream;
 use futures_util::StreamExt;
@@ -41,15 +43,15 @@ async fn run_app(mut terminal: DefaultTerminal) -> Result<()> {
     let cwd = env::current_dir()?.canonicalize()?;
 
     let hostname_str = hostname::get()
-        .map(|h| h.to_string_lossy().to_string())
+        .map(|h| h.to_string_lossy().into_owned())
         .unwrap_or_else(|_| "vib-client".to_string());
-    let alias = format!("vib ({})", hostname_str);
+    let alias = format!("vib ({hostname_str})");
 
     let download_dir = Arc::new(Mutex::new(cwd.clone()));
 
     let port = LOCALSEND_DEFAULT_PORT;
     let tls_config = generate_self_signed_cert(&alias)
-        .map_err(|e| crate::error::AppError::Message(e.to_string()))?;
+        .map_err(|e| crate::error::AppError::LocalSend(e.to_string()))?;
 
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<AppEvent>();
 
@@ -63,7 +65,7 @@ async fn run_app(mut terminal: DefaultTerminal) -> Result<()> {
     let discovery_task_engine = discovery_engine.clone();
     tokio::spawn(async move {
         if let Err(e) = discovery_task_engine.start().await {
-            eprintln!("Discovery engine stopped: {}", e);
+            eprintln!("Discovery engine stopped: {e}");
         }
     });
 
@@ -84,7 +86,7 @@ async fn run_app(mut terminal: DefaultTerminal) -> Result<()> {
         )
         .await
         {
-            eprintln!("LocalSend HTTPS Server error: {}", e);
+            eprintln!("LocalSend HTTPS Server error: {e}");
         }
     });
 
