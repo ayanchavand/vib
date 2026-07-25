@@ -1,211 +1,137 @@
+//! Application state management, event loop dispatching, and view models.
+
+pub mod bookmarks;
+pub mod file_ops;
+pub mod modal;
+pub mod pane;
+
+pub mod tests;
+pub mod transfers;
+
 use crate::error::AppError;
 use crate::events::{AppEvent, IncomingTransferRequest};
-use crate::fs::{self, EntryKind, FileEntry};
+use crate::fs::{EntryKind, FileEntry};
 use crate::input::Action;
 use crate::localsend::protocol::Peer;
+use bookmarks::{get_bookmark_storage_path, load_bookmarks_from_disk, save_bookmarks_to_disk};
+use file_ops::copy_dir_all;
+pub use modal::LocalSendModalState;
+use pane::BrowsingPane;
 use ratatui::widgets::ListState;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use transfers::TransferProgressInfo;
 
 const MESSAGE_TIMEOUT: Duration = Duration::from_secs(4);
 const SUCCESS_BANNER_TIMEOUT: Duration = Duration::from_secs(6);
 const FAIL_BANNER_TIMEOUT: Duration = Duration::from_secs(6);
 const ANIM_INTERVAL: Duration = Duration::from_millis(350);
 
-fn get_bookmark_storage_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|dir| dir.join("vib").join("bookmarks.json"))
-}
-
-fn load_bookmarks_from_disk(path: Option<&std::path::Path>) -> Vec<PathBuf> {
-    if let Some(path) = path
-        && path.exists()
-        && let Ok(content) = std::fs::read_to_string(path)
-        && let Ok(bookmarks) = serde_json::from_str::<Vec<PathBuf>>(&content)
-    {
-        return bookmarks;
-    }
-    Vec::new()
-}
-
-fn save_bookmarks_to_disk(bookmarks: &[PathBuf], path: Option<&std::path::Path>) {
-    if let Some(path) = path {
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Ok(json) = serde_json::to_string_pretty(bookmarks) {
-            let _ = std::fs::write(path, json);
-        }
-    }
-}
-
-fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(dst)?;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let ty = entry.file_type()?;
-        if ty.is_dir() {
-            copy_dir_all(&entry.path(), &dst.join(entry.file_name()))?;
-        } else {
-            std::fs::copy(entry.path(), dst.join(entry.file_name()))?;
-        }
-    }
-    Ok(())
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LocalSendModalState {
-    Closed,
-    Menu,
-    ReceiveMode,
-    SendMode,
-}
-
-#[derive(Debug, Clone)]
-pub struct TransferProgressInfo {
-    pub bytes_transferred: u64,
-    pub total_bytes: u64,
-    pub status: String,
-}
-
-#[derive(Clone, Debug)]
-pub struct BrowsingPane {
-    pub current_path: PathBuf,
-    pub entries: Vec<FileEntry>,
-    pub selected: usize,
-    pub list_state: ListState,
-    pub text_preview_path: Option<PathBuf>,
-    pub text_preview_lines: Vec<String>,
-    pub text_preview_scroll: usize,
-}
-
-impl BrowsingPane {
-    pub fn new(path: PathBuf) -> Self {
-        let mut list_state = ListState::default();
-        list_state.select(Some(0));
-        Self {
-            current_path: path,
-            entries: Vec::new(),
-            selected: 0,
-            list_state,
-            text_preview_path: None,
-            text_preview_lines: Vec::new(),
-            text_preview_scroll: 0,
-        }
-    }
-
-    pub fn load(&mut self) -> Result<(), AppError> {
-        let entries = crate::fs::list_dir(&self.current_path)?;
-        self.entries = entries;
-
-        if self.entries.is_empty() {
-            self.selected = 0;
-            self.list_state.select(None);
-        } else {
-            if self.selected >= self.entries.len() {
-                self.selected = self.entries.len() - 1;
-            }
-            self.list_state.select(Some(self.selected));
-        }
-
-        self.update_text_preview();
-        Ok(())
-    }
-
-    pub fn update_text_preview(&mut self) {
-        if let Some(entry) = self.entries.get(self.selected)
-            && (entry.kind == EntryKind::Text || entry.kind == EntryKind::Unknown)
-        {
-            if self.text_preview_path.as_ref() != Some(&entry.path) {
-                self.text_preview_path = Some(entry.path.clone());
-                self.text_preview_scroll = 0;
-                self.text_preview_lines = match std::fs::read_to_string(&entry.path) {
-                    Ok(content) => content.lines().map(|s| s.to_string()).collect(),
-                    Err(_) => vec!["[Unable to read text preview]".to_string()],
-                };
-            }
-            return;
-        }
-        self.text_preview_path = None;
-        self.text_preview_lines.clear();
-        self.text_preview_scroll = 0;
-    }
-}
-
+/// Core application state container holding file browser panes, modals, transfers, and peer devices.
 pub struct AppState {
+    /// Active file browsing panes (1 for single pane, 2 for dual-pane mode).
     pub panes: Vec<BrowsingPane>,
+    /// Index of currently focused browsing pane (0 or 1).
     pub active_pane: usize,
 
+    /// Currently active directory path (synced with active pane).
     pub current_path: PathBuf,
+    /// List of file entries in active directory (synced with active pane).
     pub entries: Vec<FileEntry>,
+    /// Index of currently selected file entry (synced with active pane).
     pub selected: usize,
+    /// List state for rendering file explorer (synced with active pane).
     pub list_state: ListState,
 
-    // Bookmarking Feature
+    /// Bookmarked system paths.
     pub bookmarks: Vec<PathBuf>,
+    /// Selected index in bookmark list modal.
     pub bookmark_selected: usize,
+    /// List state for bookmark modal view.
     pub bookmark_list_state: ListState,
+    /// Flag indicating whether bookmark modal is displayed.
     pub show_bookmark_modal: bool,
+    /// Optional file path for storing bookmarks JSON.
     pub bookmark_path: Option<PathBuf>,
 
-    // File Operations / Clipboard
+    /// Paths copied or cut to application clipboard.
     pub clipboard: Vec<PathBuf>,
+    /// Flag indicating whether clipboard action is a cut/move operation (`true`) or copy (`false`).
     pub clipboard_is_cut: bool,
 
-    // Text File Preview Pane
+    /// Path of file currently loaded in preview pane.
     pub text_preview_path: Option<PathBuf>,
+    /// Line buffer of file preview content.
     pub text_preview_lines: Vec<String>,
+    /// Scroll offset line count for preview pane.
     pub text_preview_scroll: usize,
 
-    // Multi-selection (tagged files to send)
+    /// Set of tagged file paths marked for multi-selection / transfer.
     pub tagged_files: HashSet<PathBuf>,
 
-    // LocalSend Overlay Modal (triggered via `t`)
+    /// State of the LocalSend modal overlay interface.
     pub localsend_modal: LocalSendModalState,
-    pub localsend_modal_selected: usize, // 0 for Send, 1 for Receive
+    /// Highlighted option in LocalSend main menu (0 = Send, 1 = Receive).
+    pub localsend_modal_selected: usize,
 
-    // 3-Frame Receive Mode ASCII Animation
+    /// Frame index for ASCII animation (0..=2).
     pub anim_frame: usize,
+    /// Timestamp of last animation tick update.
     pub last_anim_tick: Instant,
 
-    // Receiving Progress & Big Fat Success/Fail Banner
-    pub active_receive_progress: Option<(u64, u64, String)>, // (bytes, total, file_name)
-    pub success_banner: Option<(String, Instant)>,           // (message, timestamp)
-    pub fail_banner: Option<(String, Instant)>,              // (message, timestamp)
+    /// Progress state for active receive session: `(bytes_transferred, total_bytes, title)`.
+    pub active_receive_progress: Option<(u64, u64, String)>,
+    /// Success banner message popup and timestamp.
+    pub success_banner: Option<(String, Instant)>,
+    /// Failure banner message popup and timestamp.
+    pub fail_banner: Option<(String, Instant)>,
 
-    // LocalSend Peers
+    /// Discovered LocalSend peers indexed by TLS fingerprint.
     pub peers: HashMap<String, Peer>,
+    /// Vector list of discovered LocalSend peers for list selection.
     pub peer_list: Vec<Peer>,
+    /// Selected index in peer device list.
     pub peer_selected: usize,
+    /// List state for rendering peer device list.
     pub peer_list_state: ListState,
 
-    // Incoming Transfer Requests Queue
+    /// Queue of incoming transfer requests waiting for user confirmation.
     pub incoming_requests: Vec<IncomingTransferRequest>,
-
-    // Active Transfers
+    /// Active/recent transfer session progress information mapped by session ID.
     pub transfers: HashMap<String, TransferProgressInfo>,
 
-    // Modals & Interactivity
+    /// Flag indicating whether LocalSend send device picker modal is open.
     pub show_send_modal: bool,
+    /// Flag indicating whether new folder input modal is open.
     pub show_new_folder_modal: bool,
+    /// Input buffer for new folder creation dialogue.
     pub new_folder_input: String,
+    /// Flag indicating whether item rename dialogue is open.
     pub show_rename_modal: bool,
+    /// Input buffer for item rename dialogue.
     pub rename_input: String,
+    /// Target path being renamed.
     pub rename_target_path: Option<PathBuf>,
 
-    // Local Device Info & Settings
+    /// Device alias identifier for LocalSend discovery.
     pub alias: String,
+    /// TLS certificate SHA-256 fingerprint.
     pub fingerprint: String,
+    /// Bound LocalSend network port.
     pub port: u16,
+    /// Shared path pointing to active download destination directory.
     pub download_dir: Arc<Mutex<PathBuf>>,
 
-    // Status & Error
+    /// Transient status message and creation timestamp.
     pub status_message: Option<(String, Instant)>,
+    /// Transient error message and creation timestamp.
     pub error: Option<(AppError, Instant)>,
 }
 
 impl AppState {
+    /// Creates a new `AppState` instance initialized with root path and LocalSend identity credentials.
     pub fn new(
         path: PathBuf,
         alias: String,
@@ -278,6 +204,7 @@ impl AppState {
         app
     }
 
+    /// Synchronizes active pane state fields to root `AppState` fields for rendering compatibility.
     pub fn sync_active_pane(&mut self) {
         if let Some(pane) = self.panes.get(self.active_pane) {
             self.current_path = pane.current_path.clone();
@@ -290,6 +217,7 @@ impl AppState {
         }
     }
 
+    /// Switches focus to pane at `index` (0 or 1), opening pane 2 if not previously open.
     pub fn switch_to_pane(&mut self, index: usize) -> Result<(), AppError> {
         if index >= 2 {
             return Ok(());
@@ -310,6 +238,7 @@ impl AppState {
         Ok(())
     }
 
+    /// Cycles focus to next available browsing pane.
     pub fn toggle_pane(&mut self) -> Result<(), AppError> {
         if self.panes.len() < 2 {
             self.switch_to_pane(1)?;
@@ -320,6 +249,7 @@ impl AppState {
         Ok(())
     }
 
+    /// Closes currently focused secondary browsing pane, leaving single pane active.
     pub fn close_current_pane(&mut self) -> Result<(), AppError> {
         if self.panes.len() > 1 {
             self.panes.remove(self.active_pane);
@@ -332,6 +262,7 @@ impl AppState {
         Ok(())
     }
 
+    /// Reloads directory entries for all open panes.
     pub fn reload_all_panes(&mut self) {
         for pane in &mut self.panes {
             let _ = pane.load();
@@ -339,9 +270,10 @@ impl AppState {
         self.sync_active_pane();
     }
 
+    /// Loads active pane entries from disk and updates download directory target.
     pub fn load(&mut self) -> std::io::Result<()> {
         if let Some(pane) = self.panes.get_mut(self.active_pane) {
-            let entries = fs::list_dir(&pane.current_path)?;
+            let entries = crate::fs::list_dir(&pane.current_path)?;
             pane.entries = entries;
             if pane.selected >= pane.entries.len() && !pane.entries.is_empty() {
                 pane.selected = pane.entries.len() - 1;
@@ -358,6 +290,7 @@ impl AppState {
         Ok(())
     }
 
+    /// Updates text file preview buffer based on currently selected entry.
     pub fn update_text_preview(&mut self) {
         if let Some(entry) = self.entries.get(self.selected)
             && (entry.kind == EntryKind::Text || entry.kind == EntryKind::Unknown)
@@ -377,8 +310,8 @@ impl AppState {
         self.text_preview_scroll = 0;
     }
 
+    /// Processes user input `Action` against current application and modal state.
     pub fn handle_action(&mut self, action: Action) -> Result<Option<PathBuf>, AppError> {
-        // If big fat success banner is open, any key dismisses it
         if self.success_banner.is_some()
             && matches!(action, Action::Enter | Action::Back | Action::Quit)
         {
@@ -386,7 +319,6 @@ impl AppState {
             return Ok(None);
         }
 
-        // If big fat fail banner is open, any key dismisses it
         if self.fail_banner.is_some()
             && matches!(action, Action::Enter | Action::Back | Action::Quit)
         {
@@ -394,19 +326,20 @@ impl AppState {
             return Ok(None);
         }
 
-        // If LocalSend Overlay Modal is Open
         if self.localsend_modal != LocalSendModalState::Closed {
             match action {
                 Action::Quit => return Err(AppError::Message("Quit".to_string())),
                 Action::ToggleLocalSendModal => {
-                    if self.active_receive_progress.is_some() || !self.incoming_requests.is_empty() {
+                    if self.active_receive_progress.is_some() || !self.incoming_requests.is_empty()
+                    {
                         self.cancel_active_transfer();
                     } else {
                         self.localsend_modal = LocalSendModalState::Closed;
                     }
                 }
                 Action::Back => {
-                    if self.active_receive_progress.is_some() || !self.incoming_requests.is_empty() {
+                    if self.active_receive_progress.is_some() || !self.incoming_requests.is_empty()
+                    {
                         self.cancel_active_transfer();
                     } else if self.localsend_modal == LocalSendModalState::SendMode
                         || self.localsend_modal == LocalSendModalState::ReceiveMode
@@ -449,22 +382,17 @@ impl AppState {
                 Action::Enter => {
                     if self.localsend_modal == LocalSendModalState::Menu {
                         if self.localsend_modal_selected == 1 {
-                            // Receive Mode selected
                             self.localsend_modal = LocalSendModalState::ReceiveMode;
                             self.set_status(
                                 "Listening for incoming LocalSend transfers...".to_string(),
                             );
+                        } else if !self.tagged_files.is_empty() {
+                            self.localsend_modal = LocalSendModalState::SendMode;
                         } else {
-                            // Send Mode selected
-                            if !self.tagged_files.is_empty() {
-                                self.localsend_modal = LocalSendModalState::SendMode;
-                            } else {
-                                self.localsend_modal_selected = 1;
-                                self.set_status(
-                                    "No files selected! Select files using [Space] first."
-                                        .to_string(),
-                                );
-                            }
+                            self.localsend_modal_selected = 1;
+                            self.set_status(
+                                "No files selected! Select files using [Space] first.".to_string(),
+                            );
                         }
                     } else if self.localsend_modal == LocalSendModalState::ReceiveMode {
                         self.accept_current_incoming();
@@ -484,7 +412,6 @@ impl AppState {
             return Ok(None);
         }
 
-        // Bookmark Overlay Modal
         if self.show_bookmark_modal {
             match action {
                 Action::Quit => return Err(AppError::Message("Quit".to_string())),
@@ -507,47 +434,36 @@ impl AppState {
             return Ok(None);
         }
 
-        // Main File Browser view
         match action {
             Action::Quit => return Err(AppError::Message("Quit".to_string())),
-
             Action::SwitchPane(idx) => {
                 self.switch_to_pane(idx)?;
             }
-
             Action::TogglePane => {
                 self.toggle_pane()?;
             }
-
             Action::ClosePane => {
                 self.close_current_pane()?;
             }
-
             Action::NewFolder => {
                 self.show_new_folder_modal = true;
                 self.new_folder_input.clear();
             }
-
             Action::Rename => {
                 self.open_rename_modal();
             }
-
             Action::CopyTagged => {
                 self.copy_tagged();
             }
-
             Action::CutTagged => {
                 self.cut_tagged();
             }
-
             Action::PasteClipboard => {
                 self.paste_clipboard()?;
             }
-
             Action::ToggleBookmark => {
                 self.toggle_bookmark_current();
             }
-
             Action::ToggleBookmarkModal => {
                 self.show_bookmark_modal = !self.show_bookmark_modal;
                 if self.show_bookmark_modal {
@@ -563,7 +479,6 @@ impl AppState {
                         });
                 }
             }
-
             Action::ToggleLocalSendModal => {
                 if self.localsend_modal != LocalSendModalState::Closed {
                     self.localsend_modal = LocalSendModalState::Closed;
@@ -576,7 +491,6 @@ impl AppState {
                     }
                 }
             }
-
             Action::ScrollPreviewDown => {
                 if !self.text_preview_lines.is_empty()
                     && self.text_preview_scroll + 1 < self.text_preview_lines.len()
@@ -584,33 +498,26 @@ impl AppState {
                     self.text_preview_scroll += 1;
                 }
             }
-
             Action::ScrollPreviewUp => {
                 if self.text_preview_scroll > 0 {
                     self.text_preview_scroll -= 1;
                 }
             }
-
             Action::Up => {
                 self.select_prev();
             }
-
             Action::Down => {
                 self.select_next();
             }
-
             Action::Enter => {
                 self.enter_selected()?;
             }
-
             Action::ToggleSelect => {
                 self.toggle_select_current();
             }
-
             Action::SelectAll => {
                 self.select_all_in_current_dir();
             }
-
             Action::OpenSendModal => {
                 if !self.tagged_files.is_empty() {
                     self.localsend_modal = LocalSendModalState::SendMode;
@@ -623,31 +530,28 @@ impl AppState {
                     );
                 }
             }
-
             Action::AcceptTransfer => {
                 self.accept_current_incoming();
             }
-
             Action::Back => {
                 self.go_up()?;
             }
-
             Action::ScanPeers => {
                 self.set_status("Scanning local network for LocalSend devices... [r]".to_string());
             }
-
             _ => {}
         }
 
         Ok(None)
     }
 
+    /// Copies currently tagged files or focused file to clipboard.
     pub fn copy_tagged(&mut self) {
         if !self.tagged_files.is_empty() {
             self.clipboard = self.tagged_files.iter().cloned().collect();
             self.clipboard_is_cut = false;
             let count = self.clipboard.len();
-            self.set_status(format!("Copied {} selected item(s) to clipboard.", count));
+            self.set_status(format!("Copied {count} selected item(s) to clipboard."));
         } else if let Some(entry) = self.entries.get(self.selected) {
             self.clipboard = vec![entry.path.clone()];
             self.clipboard_is_cut = false;
@@ -657,12 +561,13 @@ impl AppState {
         }
     }
 
+    /// Cuts currently tagged files or focused file to clipboard.
     pub fn cut_tagged(&mut self) {
         if !self.tagged_files.is_empty() {
             self.clipboard = self.tagged_files.iter().cloned().collect();
             self.clipboard_is_cut = true;
             let count = self.clipboard.len();
-            self.set_status(format!("Cut {} selected item(s) to clipboard.", count));
+            self.set_status(format!("Cut {count} selected item(s) to clipboard."));
         } else if let Some(entry) = self.entries.get(self.selected) {
             self.clipboard = vec![entry.path.clone()];
             self.clipboard_is_cut = true;
@@ -672,6 +577,7 @@ impl AppState {
         }
     }
 
+    /// Pastes files in application clipboard into currently active directory.
     pub fn paste_clipboard(&mut self) -> Result<(), AppError> {
         if self.clipboard.is_empty() {
             self.set_status("Clipboard is empty! Copy [c] or cut [x] files first.".to_string());
@@ -706,12 +612,10 @@ impl AppState {
                             .map(|_| ())
                     }
                 })
+            } else if src.is_dir() {
+                copy_dir_all(&src, &dest)
             } else {
-                if src.is_dir() {
-                    copy_dir_all(&src, &dest)
-                } else {
-                    std::fs::copy(&src, &dest).map(|_| ())
-                }
+                std::fs::copy(&src, &dest).map(|_| ())
             };
 
             if res.is_ok() {
@@ -728,19 +632,18 @@ impl AppState {
 
         if is_cut {
             self.set_status(format!(
-                "Moved {} item(s) into current directory.",
-                success_count
+                "Moved {success_count} item(s) into current directory."
             ));
         } else {
             self.set_status(format!(
-                "Copied {} item(s) into current directory.",
-                success_count
+                "Copied {success_count} item(s) into current directory."
             ));
         }
 
         Ok(())
     }
 
+    /// Creates new subfolder inside current directory using text from `new_folder_input`.
     pub fn create_new_folder(&mut self) -> Result<(), AppError> {
         let name = self.new_folder_input.trim().to_string();
         if name.is_empty() {
@@ -755,8 +658,7 @@ impl AppState {
         let target_path = self.current_path.join(&name);
         if target_path.exists() {
             self.set_error(AppError::Message(format!(
-                "Directory or file '{}' already exists!",
-                name
+                "Directory or file '{name}' already exists!"
             )));
             self.show_new_folder_modal = false;
             self.new_folder_input.clear();
@@ -773,20 +675,20 @@ impl AppState {
                     self.list_state.select(Some(self.selected));
                     self.update_text_preview();
                 }
-                self.set_status(format!("Created new folder: {}", name));
+                self.set_status(format!("Created new folder: {name}"));
             }
             Err(e) => {
                 self.show_new_folder_modal = false;
                 self.new_folder_input.clear();
                 self.set_error(AppError::Message(format!(
-                    "Failed to create folder '{}': {}",
-                    name, e
+                    "Failed to create folder '{name}': {e}"
                 )));
             }
         }
         Ok(())
     }
 
+    /// Opens rename dialogue initialized with currently focused file name.
     pub fn open_rename_modal(&mut self) {
         if let Some(entry) = self.entries.get(self.selected) {
             self.rename_input = entry.name.clone();
@@ -797,6 +699,7 @@ impl AppState {
         }
     }
 
+    /// Renames file or directory at `rename_target_path` to `rename_input`.
     pub fn perform_rename(&mut self) -> Result<(), AppError> {
         let old_path = match self.rename_target_path.take() {
             Some(path) => path,
@@ -834,8 +737,7 @@ impl AppState {
 
         if new_path.exists() {
             self.set_error(AppError::Message(format!(
-                "An item named '{}' already exists!",
-                new_name
+                "An item named '{new_name}' already exists!"
             )));
             self.show_rename_modal = false;
             self.rename_input.clear();
@@ -852,13 +754,11 @@ impl AppState {
                 self.show_rename_modal = false;
                 self.rename_input.clear();
 
-                // Update bookmark entries if renamed item was bookmarked
                 if let Some(pos) = self.bookmarks.iter().position(|b| b == &old_path) {
                     self.bookmarks[pos] = new_path.clone();
                     self.save_bookmarks();
                 }
 
-                // Update tagged files set if renamed item was selected
                 if self.tagged_files.contains(&old_path) {
                     self.tagged_files.remove(&old_path);
                     self.tagged_files.insert(new_path.clone());
@@ -872,14 +772,13 @@ impl AppState {
                     self.update_text_preview();
                 }
 
-                self.set_status(format!("Renamed '{}' to '{}'", old_name, new_name));
+                self.set_status(format!("Renamed '{old_name}' to '{new_name}'"));
             }
             Err(e) => {
                 self.show_rename_modal = false;
                 self.rename_input.clear();
                 self.set_error(AppError::Message(format!(
-                    "Failed to rename '{}': {}",
-                    old_name, e
+                    "Failed to rename '{old_name}': {e}"
                 )));
             }
         }
@@ -887,6 +786,7 @@ impl AppState {
         Ok(())
     }
 
+    /// Processes single keypress for active text input modal (new folder or rename).
     pub fn handle_input_key(&mut self, key: crossterm::event::KeyEvent) -> Result<(), AppError> {
         if self.show_new_folder_modal {
             match key.code {
@@ -927,10 +827,12 @@ impl AppState {
         Ok(())
     }
 
+    /// Saves current bookmarks list to disk.
     pub fn save_bookmarks(&self) {
         save_bookmarks_to_disk(&self.bookmarks, self.bookmark_path.as_deref());
     }
 
+    /// Toggles bookmark state for focused entry or current directory path.
     pub fn toggle_bookmark_current(&mut self) {
         let target = if let Some(entry) = self.entries.get(self.selected) {
             entry.path.clone()
@@ -960,6 +862,7 @@ impl AppState {
         self.save_bookmarks();
     }
 
+    /// Highlights previous bookmark entry in modal.
     pub fn select_prev_bookmark(&mut self) {
         if self.bookmarks.is_empty() {
             return;
@@ -973,6 +876,7 @@ impl AppState {
             .select(Some(self.bookmark_selected));
     }
 
+    /// Highlights next bookmark entry in modal.
     pub fn select_next_bookmark(&mut self) {
         if self.bookmarks.is_empty() {
             return;
@@ -986,6 +890,7 @@ impl AppState {
             .select(Some(self.bookmark_selected));
     }
 
+    /// Deletes currently highlighted bookmark entry.
     pub fn delete_selected_bookmark(&mut self) {
         if self.bookmarks.is_empty() {
             self.set_status("No bookmarks to delete.".to_string());
@@ -1007,6 +912,7 @@ impl AppState {
         }
     }
 
+    /// Jumps active file browser pane to path of highlighted bookmark.
     pub fn jump_to_selected_bookmark(&mut self) -> Result<(), AppError> {
         if self.bookmarks.is_empty() {
             self.set_status("No bookmarks saved yet!".to_string());
@@ -1031,26 +937,25 @@ impl AppState {
                     }
                     self.set_status(format!("Jumped to file: {}", target.display()));
                 }
+            } else if let Some(parent) = target.parent().filter(|p| p.exists()) {
+                self.current_path = parent.to_path_buf();
+                self.selected = 0;
+                self.load()?;
+                self.set_error(AppError::Message(format!(
+                    "Target path no longer exists: {}",
+                    target.display()
+                )));
             } else {
-                if let Some(parent) = target.parent().filter(|p| p.exists()) {
-                    self.current_path = parent.to_path_buf();
-                    self.selected = 0;
-                    self.load()?;
-                    self.set_error(AppError::Message(format!(
-                        "Target path no longer exists: {}",
-                        target.display()
-                    )));
-                } else {
-                    self.set_error(AppError::Message(format!(
-                        "Bookmarked path not found: {}",
-                        target.display()
-                    )));
-                }
+                self.set_error(AppError::Message(format!(
+                    "Bookmarked path not found: {}",
+                    target.display()
+                )));
             }
         }
         Ok(())
     }
 
+    /// Moves focused selection upward in active pane file list.
     pub fn select_prev(&mut self) {
         if self.entries.is_empty() {
             return;
@@ -1071,6 +976,7 @@ impl AppState {
         }
     }
 
+    /// Moves focused selection downward in active pane file list.
     pub fn select_next(&mut self) {
         if self.entries.is_empty() {
             return;
@@ -1091,6 +997,7 @@ impl AppState {
         }
     }
 
+    /// Moves focus upward in LocalSend peer selection list.
     pub fn select_prev_peer(&mut self) {
         if self.peer_list.is_empty() {
             return;
@@ -1103,6 +1010,7 @@ impl AppState {
         self.peer_list_state.select(Some(self.peer_selected));
     }
 
+    /// Moves focus downward in LocalSend peer selection list.
     pub fn select_next_peer(&mut self) {
         if self.peer_list.is_empty() {
             return;
@@ -1115,6 +1023,7 @@ impl AppState {
         self.peer_list_state.select(Some(self.peer_selected));
     }
 
+    /// Enters focused entry (opens directory or launches system default file viewer).
     pub fn enter_selected(&mut self) -> std::io::Result<()> {
         if let Some(entry) = self.entries.get(self.selected) {
             match entry.kind {
@@ -1136,7 +1045,7 @@ impl AppState {
                     let name = entry.name.clone();
                     match open::that(&path) {
                         Ok(_) => {
-                            self.set_status(format!("Opened file: {}", name));
+                            self.set_status(format!("Opened file: {name}"));
                         }
                         Err(_) => {
                             self.set_error(AppError::Message(
@@ -1150,6 +1059,7 @@ impl AppState {
         Ok(())
     }
 
+    /// Navigates active pane to parent directory.
     pub fn go_up(&mut self) -> std::io::Result<()> {
         if let Some(parent) = self.current_path.parent().map(|p| p.to_path_buf()) {
             let previous_path = self.current_path.clone();
@@ -1174,6 +1084,7 @@ impl AppState {
         Ok(())
     }
 
+    /// Toggles tagged status for currently focused file entry.
     pub fn toggle_select_current(&mut self) {
         if let Some(entry) = self.entries.get(self.selected) {
             let path = entry.path.clone();
@@ -1187,6 +1098,7 @@ impl AppState {
         }
     }
 
+    /// Selects or deselects all file entries in active directory.
     pub fn select_all_in_current_dir(&mut self) {
         let all_tagged = self
             .entries
@@ -1205,6 +1117,7 @@ impl AppState {
         }
     }
 
+    /// Accepts pending incoming LocalSend transfer request.
     pub fn accept_current_incoming(&mut self) {
         if !self.incoming_requests.is_empty() {
             let req = self.incoming_requests.remove(0);
@@ -1223,6 +1136,7 @@ impl AppState {
         }
     }
 
+    /// Declines pending incoming LocalSend transfer request.
     pub fn decline_current_incoming(&mut self) {
         if !self.incoming_requests.is_empty() {
             let req = self.incoming_requests.remove(0);
@@ -1230,7 +1144,7 @@ impl AppState {
             if let Some(tx) = req.response_tx.lock().unwrap().take() {
                 let _ = tx.send(false);
             }
-            let msg = format!("Transfer from {} was cancelled/declined.", peer_alias);
+            let msg = format!("Transfer from {peer_alias} was cancelled/declined.");
             self.fail_banner = Some((msg.clone(), Instant::now()));
             self.set_status(msg);
         } else {
@@ -1238,6 +1152,7 @@ impl AppState {
         }
     }
 
+    /// Cancels active transfer session or pending request and displays failure banner.
     pub fn cancel_active_transfer(&mut self) {
         let mut cancelled = false;
         if self.active_receive_progress.is_some() {
@@ -1259,6 +1174,7 @@ impl AppState {
         }
     }
 
+    /// Processes an incoming system or LocalSend `AppEvent`.
     pub fn handle_event(&mut self, event: AppEvent) {
         match event {
             AppEvent::PeerDiscovered(peer) => {
@@ -1278,8 +1194,7 @@ impl AppState {
                 self.incoming_requests.push(request);
                 self.localsend_modal = LocalSendModalState::ReceiveMode;
                 self.set_status(format!(
-                    "INCOMING REQUEST from {}! Press [y] to Accept or [n] to Decline.",
-                    peer_alias
+                    "INCOMING REQUEST from {peer_alias}! Press [y] to Accept or [n] to Decline."
                 ));
             }
             AppEvent::TransferProgress {
@@ -1289,18 +1204,18 @@ impl AppState {
                 total_bytes,
                 is_upload,
             } => {
-                if let Some(entry) = self.transfers.get(&session_id) {
-                    if entry.status.starts_with("Cancelled") || entry.status.starts_with("Failed") {
-                        return;
-                    }
+                if let Some(entry) = self.transfers.get(&session_id)
+                    && (entry.status.starts_with("Cancelled") || entry.status.starts_with("Failed"))
+                {
+                    return;
                 }
                 if self.fail_banner.is_some() {
                     return;
                 }
                 let progress_title = if is_upload {
-                    format!("Uploading {}", file_id)
+                    format!("Uploading {file_id}")
                 } else {
-                    format!("Receiving {}", file_id)
+                    format!("Receiving {file_id}")
                 };
                 self.active_receive_progress =
                     Some((bytes_transferred, total_bytes, progress_title));
@@ -1329,7 +1244,7 @@ impl AppState {
                 }
                 self.success_banner = Some((message.clone(), Instant::now()));
                 self.set_status(message);
-                let _ = self.load(); // Refresh file browser so newly received file immediately appears!
+                let _ = self.load();
             }
             AppEvent::TransferFailed { session_id, error } => {
                 self.active_receive_progress = None;
@@ -1339,7 +1254,7 @@ impl AppState {
                         let _ = tx.send(false);
                     }
                 }
-                let status_msg = format!("Cancelled / Failed: {}", error);
+                let status_msg = format!("Cancelled / Failed: {error}");
                 if let Some(entry) = self.transfers.get_mut(&session_id) {
                     entry.status = status_msg.clone();
                 } else {
@@ -1353,9 +1268,9 @@ impl AppState {
                     );
                 }
                 let banner_msg = if error.to_lowercase().contains("cancel") {
-                    format!("Transfer Cancelled: {}", error)
+                    format!("Transfer Cancelled: {error}")
                 } else {
-                    format!("Transfer Failed: {}", error)
+                    format!("Transfer Failed: {error}")
                 };
                 self.fail_banner = Some((banner_msg, Instant::now()));
                 self.set_error(AppError::Message(error));
@@ -1369,6 +1284,7 @@ impl AppState {
         }
     }
 
+    /// Advances animation timer frame and clears expired status messages.
     pub fn update(&mut self) {
         self.clear_expired_messages();
         if self.last_anim_tick.elapsed() >= ANIM_INTERVAL {
@@ -1377,15 +1293,18 @@ impl AppState {
         }
     }
 
+    /// Sets transient status message displayed in status bar.
     pub fn set_status(&mut self, msg: String) {
         self.status_message = Some((msg, Instant::now()));
         self.error = None;
     }
 
+    /// Sets transient error message displayed in status bar.
     pub fn set_error(&mut self, err: AppError) {
         self.error = Some((err, Instant::now()));
     }
 
+    /// Clears expired status messages, errors, and modal banners after timeout expiry.
     pub fn clear_expired_messages(&mut self) {
         if let Some((_, time)) = self.status_message
             && time.elapsed() > MESSAGE_TIMEOUT
@@ -1407,299 +1326,5 @@ impl AppState {
         {
             self.fail_banner = None;
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::path::PathBuf;
-
-    #[test]
-    fn test_bookmark_toggle_and_delete() {
-        let download_dir = Arc::new(Mutex::new(PathBuf::from("/tmp")));
-        let mut app = AppState::new(
-            PathBuf::from("/tmp"),
-            "test".to_string(),
-            "fp".to_string(),
-            8080,
-            download_dir,
-        );
-        app.bookmark_path = None;
-
-        let path1 = PathBuf::from("/tmp/dir1");
-        let path2 = PathBuf::from("/tmp/dir2");
-
-        app.bookmarks.clear();
-        app.bookmarks.push(path1.clone());
-        app.bookmarks.push(path2.clone());
-        app.bookmark_selected = 0;
-        app.bookmark_list_state.select(Some(0));
-
-        assert_eq!(app.bookmarks.len(), 2);
-
-        app.select_next_bookmark();
-        assert_eq!(app.bookmark_selected, 1);
-
-        app.delete_selected_bookmark();
-        assert_eq!(app.bookmarks.len(), 1);
-        assert_eq!(app.bookmarks[0], path1);
-    }
-
-    #[test]
-    fn test_go_up_remembers_previous_folder() {
-        let cwd = std::env::current_dir().unwrap().canonicalize().unwrap();
-        if let Some(parent) = cwd.parent() {
-            let download_dir = Arc::new(Mutex::new(cwd.clone()));
-            let mut app = AppState::new(
-                cwd.clone(),
-                "test".to_string(),
-                "fp".to_string(),
-                8080,
-                download_dir,
-            );
-            app.bookmark_path = None;
-
-            let _ = app.go_up();
-            assert_eq!(app.current_path, parent);
-            if let Some(pos) = app.entries.iter().position(|e| e.path == cwd) {
-                assert_eq!(app.selected, pos);
-            }
-        }
-    }
-
-    #[test]
-    fn test_copy_cut_tagged_files() {
-        let download_dir = Arc::new(Mutex::new(PathBuf::from("/tmp")));
-        let mut app = AppState::new(
-            PathBuf::from("/tmp"),
-            "test".to_string(),
-            "fp".to_string(),
-            8080,
-            download_dir,
-        );
-        app.bookmark_path = None;
-
-        app.copy_tagged();
-        assert!(app.clipboard.is_empty());
-
-        let file1 = PathBuf::from("/tmp/file1.txt");
-        app.entries.push(crate::fs::FileEntry {
-            name: "file1.txt".to_string(),
-            path: file1.clone(),
-            kind: crate::fs::EntryKind::Text,
-            size: Some(100),
-            modified: None,
-        });
-        app.selected = 0;
-
-        app.copy_tagged();
-        assert_eq!(app.clipboard.len(), 1);
-        assert_eq!(app.clipboard[0], file1);
-        assert!(!app.clipboard_is_cut);
-
-        app.cut_tagged();
-        assert_eq!(app.clipboard.len(), 1);
-        assert_eq!(app.clipboard[0], file1);
-        assert!(app.clipboard_is_cut);
-
-        let file2 = PathBuf::from("/tmp/file2.txt");
-        app.tagged_files.insert(file2.clone());
-
-        app.copy_tagged();
-        assert_eq!(app.clipboard.len(), 1);
-        assert_eq!(app.clipboard[0], file2);
-        assert!(!app.clipboard_is_cut);
-    }
-
-    #[test]
-    fn test_create_new_folder() {
-        let temp_dir = std::env::temp_dir().join(format!("vib_test_{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&temp_dir).unwrap();
-
-        let download_dir = Arc::new(Mutex::new(temp_dir.clone()));
-        let mut app = AppState::new(
-            temp_dir.clone(),
-            "test".to_string(),
-            "fp".to_string(),
-            8080,
-            download_dir,
-        );
-        app.bookmark_path = None;
-
-        app.new_folder_input = "test_subfolder".to_string();
-        app.create_new_folder().unwrap();
-
-        let created_path = temp_dir.join("test_subfolder");
-        assert!(created_path.exists());
-        assert!(created_path.is_dir());
-
-        let _ = std::fs::remove_dir_all(&temp_dir);
-    }
-
-    #[test]
-    fn test_perform_rename() {
-        let temp_dir =
-            std::env::temp_dir().join(format!("vib_test_rename_{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&temp_dir).unwrap();
-
-        let old_file = temp_dir.join("old_name.txt");
-        std::fs::write(&old_file, "hello world").unwrap();
-
-        let download_dir = Arc::new(Mutex::new(temp_dir.clone()));
-        let mut app = AppState::new(
-            temp_dir.clone(),
-            "test".to_string(),
-            "fp".to_string(),
-            8080,
-            download_dir,
-        );
-        app.bookmark_path = None;
-        app.load().unwrap();
-
-        if let Some(pos) = app.entries.iter().position(|e| e.path == old_file) {
-            app.selected = pos;
-            app.open_rename_modal();
-            app.rename_input = "new_name.txt".to_string();
-            app.perform_rename().unwrap();
-
-            let new_file = temp_dir.join("new_name.txt");
-            assert!(!old_file.exists());
-            assert!(new_file.exists());
-        }
-
-        let _ = std::fs::remove_dir_all(&temp_dir);
-    }
-
-    #[test]
-    fn test_dual_browsing_panes() {
-        let temp_dir =
-            std::env::temp_dir().join(format!("vib_test_panes_{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&temp_dir).unwrap();
-
-        let download_dir = Arc::new(Mutex::new(temp_dir.clone()));
-        let mut app = AppState::new(
-            temp_dir.clone(),
-            "test".to_string(),
-            "fp".to_string(),
-            8080,
-            download_dir,
-        );
-        app.bookmark_path = None;
-
-        assert_eq!(app.panes.len(), 1);
-        assert_eq!(app.active_pane, 0);
-
-        app.switch_to_pane(1).unwrap();
-        assert_eq!(app.panes.len(), 2);
-        assert_eq!(app.active_pane, 1);
-
-        app.switch_to_pane(0).unwrap();
-        assert_eq!(app.active_pane, 0);
-
-        app.toggle_pane().unwrap();
-        assert_eq!(app.active_pane, 1);
-
-        app.switch_to_pane(2).unwrap();
-        assert_eq!(app.panes.len(), 2);
-
-        app.close_current_pane().unwrap();
-        assert_eq!(app.panes.len(), 1);
-        assert_eq!(app.active_pane, 0);
-
-        let _ = std::fs::remove_dir_all(&temp_dir);
-    }
-
-    #[test]
-    fn test_transfer_failed_event_sets_fail_banner_and_status() {
-        let temp_dir = std::env::temp_dir().join(format!("vib_test_cancel_{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&temp_dir).unwrap();
-
-        let download_dir = Arc::new(Mutex::new(temp_dir.clone()));
-        let mut app = AppState::new(
-            temp_dir.clone(),
-            "test".to_string(),
-            "fp".to_string(),
-            8080,
-            download_dir,
-        );
-
-        app.handle_event(AppEvent::TransferFailed {
-            session_id: "session-123".to_string(),
-            error: "Transfer cancelled by peer".to_string(),
-        });
-
-        assert!(app.fail_banner.is_some());
-        let (banner_msg, _) = app.fail_banner.as_ref().unwrap();
-        assert!(banner_msg.contains("Transfer Cancelled"));
-
-        assert_eq!(
-            app.transfers.get("session-123").unwrap().status,
-            "Cancelled / Failed: Transfer cancelled by peer"
-        );
-
-        let _ = std::fs::remove_dir_all(&temp_dir);
-    }
-
-    #[test]
-    fn test_cancel_active_transfer() {
-        let temp_dir = std::env::temp_dir().join(format!("vib_test_cancel_active_{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&temp_dir).unwrap();
-
-        let download_dir = Arc::new(Mutex::new(temp_dir.clone()));
-        let mut app = AppState::new(
-            temp_dir.clone(),
-            "test".to_string(),
-            "fp".to_string(),
-            8080,
-            download_dir,
-        );
-
-        app.active_receive_progress = Some((50, 100, "test.txt".to_string()));
-        app.localsend_modal = LocalSendModalState::ReceiveMode;
-
-        app.cancel_active_transfer();
-
-        assert!(app.active_receive_progress.is_none());
-        assert_eq!(app.localsend_modal, LocalSendModalState::Closed);
-        assert!(app.fail_banner.is_some());
-        let (banner_msg, _) = app.fail_banner.as_ref().unwrap();
-        assert!(banner_msg.contains("cancelled by user"));
-
-        let _ = std::fs::remove_dir_all(&temp_dir);
-    }
-
-    #[test]
-    fn test_stale_transfer_progress_ignored_after_failure() {
-        let temp_dir = std::env::temp_dir().join(format!("vib_test_stale_progress_{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&temp_dir).unwrap();
-
-        let download_dir = Arc::new(Mutex::new(temp_dir.clone()));
-        let mut app = AppState::new(
-            temp_dir.clone(),
-            "test".to_string(),
-            "fp".to_string(),
-            8080,
-            download_dir,
-        );
-
-        app.handle_event(AppEvent::TransferFailed {
-            session_id: "s1".to_string(),
-            error: "Cancelled".to_string(),
-        });
-
-        // Try sending stale TransferProgress for the same session
-        app.handle_event(AppEvent::TransferProgress {
-            session_id: "s1".to_string(),
-            file_id: "file.bin".to_string(),
-            bytes_transferred: 50,
-            total_bytes: 100,
-            is_upload: false,
-        });
-
-        // active_receive_progress must remain None!
-        assert!(app.active_receive_progress.is_none());
-
-        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
