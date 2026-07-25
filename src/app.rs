@@ -9,8 +9,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-const MESSAGE_TIMEOUT: Duration = Duration::from_secs(3);
+const MESSAGE_TIMEOUT: Duration = Duration::from_secs(4);
 const SUCCESS_BANNER_TIMEOUT: Duration = Duration::from_secs(6);
+const FAIL_BANNER_TIMEOUT: Duration = Duration::from_secs(6);
 const ANIM_INTERVAL: Duration = Duration::from_millis(350);
 
 fn get_bookmark_storage_path() -> Option<PathBuf> {
@@ -168,9 +169,10 @@ pub struct AppState {
     pub anim_frame: usize,
     pub last_anim_tick: Instant,
 
-    // Receiving Progress & Big Fat Success Banner
+    // Receiving Progress & Big Fat Success/Fail Banner
     pub active_receive_progress: Option<(u64, u64, String)>, // (bytes, total, file_name)
     pub success_banner: Option<(String, Instant)>,           // (message, timestamp)
+    pub fail_banner: Option<(String, Instant)>,              // (message, timestamp)
 
     // LocalSend Peers
     pub peers: HashMap<String, Peer>,
@@ -252,6 +254,7 @@ impl AppState {
             last_anim_tick: Instant::now(),
             active_receive_progress: None,
             success_banner: None,
+            fail_banner: None,
             peers: HashMap::new(),
             peer_list: Vec::new(),
             peer_selected: 0,
@@ -383,15 +386,29 @@ impl AppState {
             return Ok(None);
         }
 
+        // If big fat fail banner is open, any key dismisses it
+        if self.fail_banner.is_some()
+            && matches!(action, Action::Enter | Action::Back | Action::Quit)
+        {
+            self.fail_banner = None;
+            return Ok(None);
+        }
+
         // If LocalSend Overlay Modal is Open
         if self.localsend_modal != LocalSendModalState::Closed {
             match action {
                 Action::Quit => return Err(AppError::Message("Quit".to_string())),
                 Action::ToggleLocalSendModal => {
-                    self.localsend_modal = LocalSendModalState::Closed;
+                    if self.active_receive_progress.is_some() || !self.incoming_requests.is_empty() {
+                        self.cancel_active_transfer();
+                    } else {
+                        self.localsend_modal = LocalSendModalState::Closed;
+                    }
                 }
                 Action::Back => {
-                    if self.localsend_modal == LocalSendModalState::SendMode
+                    if self.active_receive_progress.is_some() || !self.incoming_requests.is_empty() {
+                        self.cancel_active_transfer();
+                    } else if self.localsend_modal == LocalSendModalState::SendMode
                         || self.localsend_modal == LocalSendModalState::ReceiveMode
                     {
                         self.localsend_modal = LocalSendModalState::Menu;
@@ -1213,9 +1230,32 @@ impl AppState {
             if let Some(tx) = req.response_tx.lock().unwrap().take() {
                 let _ = tx.send(false);
             }
-            self.set_status(format!("Declined transfer from {}.", peer_alias));
+            let msg = format!("Transfer from {} was cancelled/declined.", peer_alias);
+            self.fail_banner = Some((msg.clone(), Instant::now()));
+            self.set_status(msg);
         } else {
             self.set_status("No incoming transfer request to decline.".to_string());
+        }
+    }
+
+    pub fn cancel_active_transfer(&mut self) {
+        let mut cancelled = false;
+        if self.active_receive_progress.is_some() {
+            self.active_receive_progress = None;
+            cancelled = true;
+        }
+        if !self.incoming_requests.is_empty() {
+            let req = self.incoming_requests.remove(0);
+            if let Some(tx) = req.response_tx.lock().unwrap().take() {
+                let _ = tx.send(false);
+            }
+            cancelled = true;
+        }
+        if cancelled || self.localsend_modal != LocalSendModalState::Closed {
+            let msg = "File transfer cancelled by user.".to_string();
+            self.fail_banner = Some((msg.clone(), Instant::now()));
+            self.set_status(msg);
+            self.localsend_modal = LocalSendModalState::Closed;
         }
     }
 
@@ -1249,6 +1289,14 @@ impl AppState {
                 total_bytes,
                 is_upload,
             } => {
+                if let Some(entry) = self.transfers.get(&session_id) {
+                    if entry.status.starts_with("Cancelled") || entry.status.starts_with("Failed") {
+                        return;
+                    }
+                }
+                if self.fail_banner.is_some() {
+                    return;
+                }
                 let progress_title = if is_upload {
                     format!("Uploading {}", file_id)
                 } else {
@@ -1275,6 +1323,7 @@ impl AppState {
                 message,
             } => {
                 self.active_receive_progress = None;
+                self.localsend_modal = LocalSendModalState::Closed;
                 if let Some(entry) = self.transfers.get_mut(&session_id) {
                     entry.status = "Completed".to_string();
                 }
@@ -1284,9 +1333,31 @@ impl AppState {
             }
             AppEvent::TransferFailed { session_id, error } => {
                 self.active_receive_progress = None;
-                if let Some(entry) = self.transfers.get_mut(&session_id) {
-                    entry.status = format!("Failed: {}", error);
+                self.localsend_modal = LocalSendModalState::Closed;
+                for req in self.incoming_requests.drain(..) {
+                    if let Some(tx) = req.response_tx.lock().unwrap().take() {
+                        let _ = tx.send(false);
+                    }
                 }
+                let status_msg = format!("Cancelled / Failed: {}", error);
+                if let Some(entry) = self.transfers.get_mut(&session_id) {
+                    entry.status = status_msg.clone();
+                } else {
+                    self.transfers.insert(
+                        session_id.clone(),
+                        TransferProgressInfo {
+                            bytes_transferred: 0,
+                            total_bytes: 0,
+                            status: status_msg.clone(),
+                        },
+                    );
+                }
+                let banner_msg = if error.to_lowercase().contains("cancel") {
+                    format!("Transfer Cancelled: {}", error)
+                } else {
+                    format!("Transfer Failed: {}", error)
+                };
+                self.fail_banner = Some((banner_msg, Instant::now()));
                 self.set_error(AppError::Message(error));
             }
             AppEvent::TriggerScan => {
@@ -1330,6 +1401,11 @@ impl AppState {
             && time.elapsed() > SUCCESS_BANNER_TIMEOUT
         {
             self.success_banner = None;
+        }
+        if let Some((_, time)) = self.fail_banner
+            && time.elapsed() > FAIL_BANNER_TIMEOUT
+        {
+            self.fail_banner = None;
         }
     }
 }
@@ -1530,6 +1606,99 @@ mod tests {
         app.close_current_pane().unwrap();
         assert_eq!(app.panes.len(), 1);
         assert_eq!(app.active_pane, 0);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_transfer_failed_event_sets_fail_banner_and_status() {
+        let temp_dir = std::env::temp_dir().join(format!("vib_test_cancel_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let download_dir = Arc::new(Mutex::new(temp_dir.clone()));
+        let mut app = AppState::new(
+            temp_dir.clone(),
+            "test".to_string(),
+            "fp".to_string(),
+            8080,
+            download_dir,
+        );
+
+        app.handle_event(AppEvent::TransferFailed {
+            session_id: "session-123".to_string(),
+            error: "Transfer cancelled by peer".to_string(),
+        });
+
+        assert!(app.fail_banner.is_some());
+        let (banner_msg, _) = app.fail_banner.as_ref().unwrap();
+        assert!(banner_msg.contains("Transfer Cancelled"));
+
+        assert_eq!(
+            app.transfers.get("session-123").unwrap().status,
+            "Cancelled / Failed: Transfer cancelled by peer"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_cancel_active_transfer() {
+        let temp_dir = std::env::temp_dir().join(format!("vib_test_cancel_active_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let download_dir = Arc::new(Mutex::new(temp_dir.clone()));
+        let mut app = AppState::new(
+            temp_dir.clone(),
+            "test".to_string(),
+            "fp".to_string(),
+            8080,
+            download_dir,
+        );
+
+        app.active_receive_progress = Some((50, 100, "test.txt".to_string()));
+        app.localsend_modal = LocalSendModalState::ReceiveMode;
+
+        app.cancel_active_transfer();
+
+        assert!(app.active_receive_progress.is_none());
+        assert_eq!(app.localsend_modal, LocalSendModalState::Closed);
+        assert!(app.fail_banner.is_some());
+        let (banner_msg, _) = app.fail_banner.as_ref().unwrap();
+        assert!(banner_msg.contains("cancelled by user"));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_stale_transfer_progress_ignored_after_failure() {
+        let temp_dir = std::env::temp_dir().join(format!("vib_test_stale_progress_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let download_dir = Arc::new(Mutex::new(temp_dir.clone()));
+        let mut app = AppState::new(
+            temp_dir.clone(),
+            "test".to_string(),
+            "fp".to_string(),
+            8080,
+            download_dir,
+        );
+
+        app.handle_event(AppEvent::TransferFailed {
+            session_id: "s1".to_string(),
+            error: "Cancelled".to_string(),
+        });
+
+        // Try sending stale TransferProgress for the same session
+        app.handle_event(AppEvent::TransferProgress {
+            session_id: "s1".to_string(),
+            file_id: "file.bin".to_string(),
+            bytes_transferred: 50,
+            total_bytes: 100,
+            is_upload: false,
+        });
+
+        // active_receive_progress must remain None!
+        assert!(app.active_receive_progress.is_none());
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

@@ -29,7 +29,9 @@ pub fn render(frame: &mut Frame, app: &mut AppState) {
     render_status_bar(frame, app, chunks[1]);
 
     // Overlays
-    if let Some((ref msg, _)) = app.success_banner {
+    if let Some((ref msg, _)) = app.fail_banner {
+        render_fail_banner_modal(frame, msg);
+    } else if let Some((ref msg, _)) = app.success_banner {
         render_success_banner_modal(frame, msg);
     } else if app.show_new_folder_modal {
         render_new_folder_modal(frame, app);
@@ -45,6 +47,17 @@ pub fn render(frame: &mut Frame, app: &mut AppState) {
 }
 
 fn render_status_bar(frame: &mut Frame, app: &AppState, area: Rect) {
+    if let Some((ref msg, _)) = app.fail_banner {
+        let p = Paragraph::new(format!(" CANCELLED: {}", msg)).style(
+            Style::default()
+                .bg(theme::RED)
+                .fg(theme::CRUST)
+                .add_modifier(Modifier::BOLD),
+        );
+        frame.render_widget(p, area);
+        return;
+    }
+
     if let Some((ref err, _)) = app.error {
         let p = Paragraph::new(format!(" ERROR: {}", err)).style(
             Style::default()
@@ -768,6 +781,13 @@ fn render_localsend_overlay(frame: &mut Frame, app: &AppState) {
                     "Uploading payload over encrypted TLS socket...",
                     Style::default().fg(theme::SUBTEXT0),
                 )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "[Esc] Cancel Transfer",
+                    Style::default()
+                        .fg(theme::RED)
+                        .add_modifier(Modifier::BOLD),
+                )),
             ];
 
             let p = Paragraph::new(lines).alignment(Alignment::Center);
@@ -963,8 +983,15 @@ fn render_localsend_overlay(frame: &mut Frame, app: &AppState) {
                     Style::default().fg(theme::TEXT),
                 )),
                 Line::from(Span::styled(
-                    "Streaming binary data from mobile device...",
+                    "Streaming binary data from peer...",
                     Style::default().fg(theme::SUBTEXT0),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "[Esc] Cancel Transfer",
+                    Style::default()
+                        .fg(theme::RED)
+                        .add_modifier(Modifier::BOLD),
                 )),
             ];
 
@@ -1076,6 +1103,80 @@ fn render_localsend_overlay(frame: &mut Frame, app: &AppState) {
             frame.render_widget(receive_paragraph, chunks[1]);
         }
     }
+}
+
+fn render_fail_banner_modal(frame: &mut Frame, msg: &str) {
+    let area = centered_rect(80, 55, frame.area());
+    frame.render_widget(Clear, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .border_style(Style::default().fg(theme::RED))
+        .style(Style::default().bg(theme::CRUST));
+
+    let banner_art = r#"
+███████╗ █████╗ ██╗██╗     ███████╗██████╗ 
+██╔════╝██╔══██╗██║██║     ██╔════╝██╔══██╗
+█████╗  ███████║██║██║     █████╗  ██║  ██║
+██╔══╝  ██╔══██║██║██║     ██╔══╝  ██║  ██║
+██║     ██║  ██║██║███████╗███████╗██████╔╝
+╚═╝     ╚═╝  ╚═╝╚═╝╚══════╝╚══════╝╚═════╝ 
+"#;
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(8), // FAILED ASCII Banner
+            Constraint::Min(0),    // Detail message
+        ])
+        .split(block.inner(area));
+
+    frame.render_widget(block, area);
+
+    let banner_paragraph = Paragraph::new(banner_art)
+        .style(
+            Style::default()
+                .fg(theme::RED)
+                .add_modifier(Modifier::BOLD),
+        )
+        .alignment(Alignment::Center);
+
+    frame.render_widget(banner_paragraph, chunks[0]);
+
+    let lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "󰅖  TRANSFER CANCELLED OR FAILED  󰅖",
+            Style::default()
+                .fg(theme::RED)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            msg,
+            Style::default()
+                .fg(theme::TEXT)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "The file transfer was stopped. No complete files were saved.",
+            Style::default().fg(theme::PEACH),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "─────────────────────────────────────────────────────────────",
+            Style::default().fg(theme::SURFACE2),
+        )),
+        Line::from(Span::styled(
+            "[Press Enter / Esc / Space to Dismiss]",
+            Style::default().fg(theme::YELLOW),
+        )),
+    ];
+
+    let detail_paragraph = Paragraph::new(lines).alignment(Alignment::Center);
+    frame.render_widget(detail_paragraph, chunks[1]);
 }
 
 fn render_success_banner_modal(frame: &mut Frame, msg: &str) {

@@ -111,12 +111,20 @@ impl LocalSendClient {
             }
         };
 
+        if res.status() == reqwest::StatusCode::FORBIDDEN {
+            let _ = event_tx.send(AppEvent::TransferFailed {
+                session_id: "unknown".to_string(),
+                error: format!("Transfer cancelled or declined by receiver ({})", peer.alias),
+            });
+            return;
+        }
+
         let prepare_resp: PrepareUploadRespDto = match res.json().await {
             Ok(r) => r,
             Err(e) => {
                 let _ = event_tx.send(AppEvent::TransferFailed {
                     session_id: "unknown".to_string(),
-                    error: format!("Peer rejected transfer: {}", e),
+                    error: format!("Transfer rejected or cancelled by peer: {}", e),
                 });
                 return;
             }
@@ -181,7 +189,7 @@ impl LocalSendClient {
                 Err(e) => {
                     let _ = event_tx.send(AppEvent::TransferFailed {
                         session_id: session_id.clone(),
-                        error: format!("Upload error: {}", e),
+                        error: format!("Upload cancelled or failed: {}", e),
                     });
                     return;
                 }
@@ -197,9 +205,14 @@ impl LocalSendClient {
                     is_upload: true,
                 });
             } else {
+                let err_msg = if res.status() == reqwest::StatusCode::FORBIDDEN {
+                    format!("Transfer cancelled by receiver ({})", peer.alias)
+                } else {
+                    format!("Upload failed with status {}", res.status())
+                };
                 let _ = event_tx.send(AppEvent::TransferFailed {
                     session_id: session_id.clone(),
-                    error: format!("Upload HTTP status {}", res.status()),
+                    error: err_msg,
                 });
                 return;
             }

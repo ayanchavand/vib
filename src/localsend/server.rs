@@ -18,6 +18,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
@@ -56,12 +57,6 @@ pub struct DownloadQuery {
     pub token: Option<String>,
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CancelQuery {
-    pub session_id: String,
-}
-
 pub async fn start_server(
     alias: String,
     fingerprint: String,
@@ -86,6 +81,10 @@ pub async fn start_server(
             post(handle_prepare_upload),
         )
         .route("/api/localsend/v2/upload", post(handle_upload))
+        .route(
+            "/api/localsend/v2/prepare-download",
+            post(handle_prepare_download),
+        )
         .route("/api/localsend/v2/download", get(handle_download))
         .route("/api/localsend/v2/cancel", post(handle_cancel))
         .with_state(state);
@@ -365,7 +364,13 @@ async fn handle_prepare_upload(
             }),
         )
             .into_response(),
-        _ => StatusCode::FORBIDDEN.into_response(),
+        _ => {
+            let _ = state.event_tx.send(AppEvent::TransferFailed {
+                session_id,
+                error: "Incoming transfer request was declined or cancelled".to_string(),
+            });
+            StatusCode::FORBIDDEN.into_response()
+        }
     }
 }
 
@@ -399,16 +404,53 @@ async fn handle_upload(
 
     let mut file = match File::create(&save_path).await {
         Ok(f) => f,
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
+        Err(_) => {
+            let _ = state.event_tx.send(AppEvent::TransferFailed {
+                session_id: query.session_id.clone(),
+                error: format!("Failed creating file {}", file_name),
+            });
+            return StatusCode::INTERNAL_SERVER_ERROR;
+        }
     };
 
     let mut stream = body.into_data_stream();
     let mut bytes_transferred = 0u64;
 
-    while let Some(chunk_result) = stream.next().await {
-        match chunk_result {
+    loop {
+        let session_exists = {
+            let sessions = state.active_sessions.lock().unwrap();
+            sessions.contains_key(&query.session_id)
+        };
+        if !session_exists {
+            let _ = tokio::fs::remove_file(&save_path).await;
+            return StatusCode::BAD_REQUEST;
+        }
+
+        let chunk_res = match tokio::time::timeout(Duration::from_secs(5), stream.next()).await {
+            Ok(Some(res)) => res,
+            Ok(None) => break,
+            Err(_) => {
+                state
+                    .active_sessions
+                    .lock()
+                    .unwrap()
+                    .remove(&query.session_id);
+                let _ = tokio::fs::remove_file(&save_path).await;
+                let _ = state.event_tx.send(AppEvent::TransferFailed {
+                    session_id: query.session_id.clone(),
+                    error: format!("Upload stream timed out or cancelled for {}", file_name),
+                });
+                return StatusCode::BAD_REQUEST;
+            }
+        };
+
+        match chunk_res {
             Ok(chunk) => {
                 if file.write_all(&chunk).await.is_err() {
+                    let _ = state.event_tx.send(AppEvent::TransferFailed {
+                        session_id: query.session_id.clone(),
+                        error: format!("Failed writing file {}", file_name),
+                    });
                     return StatusCode::INTERNAL_SERVER_ERROR;
                 }
                 bytes_transferred += chunk.len() as u64;
@@ -421,14 +463,59 @@ async fn handle_upload(
                     is_upload: false,
                 });
             }
-            Err(_) => return StatusCode::BAD_REQUEST,
+            Err(_) => {
+                state
+                    .active_sessions
+                    .lock()
+                    .unwrap()
+                    .remove(&query.session_id);
+                let _ = state.event_tx.send(AppEvent::TransferFailed {
+                    session_id: query.session_id.clone(),
+                    error: format!("Upload stream interrupted or cancelled for {}", file_name),
+                });
+                return StatusCode::BAD_REQUEST;
+            }
         }
     }
 
-    let _ = state.event_tx.send(AppEvent::TransferCompleted {
-        session_id: query.session_id,
-        message: format!("Received {}", file_name),
-    });
+    if total_size > 0 && bytes_transferred < total_size {
+        state
+            .active_sessions
+            .lock()
+            .unwrap()
+            .remove(&query.session_id);
+        let _ = tokio::fs::remove_file(&save_path).await;
+        let _ = state.event_tx.send(AppEvent::TransferFailed {
+            session_id: query.session_id,
+            error: format!(
+                "Transfer cancelled by sender (received {}/{} bytes)",
+                bytes_transferred, total_size
+            ),
+        });
+        return StatusCode::BAD_REQUEST;
+    }
+
+    let all_completed = {
+        let mut sessions = state.active_sessions.lock().unwrap();
+        if let Some(session) = sessions.get_mut(&query.session_id) {
+            session.files.remove(&query.file_id);
+            if session.files.is_empty() {
+                sessions.remove(&query.session_id);
+                true
+            } else {
+                false
+            }
+        } else {
+            true
+        }
+    };
+
+    if all_completed {
+        let _ = state.event_tx.send(AppEvent::TransferCompleted {
+            session_id: query.session_id,
+            message: format!("Received {}", file_name),
+        });
+    }
 
     StatusCode::OK
 }
@@ -479,16 +566,116 @@ async fn handle_download(
 
 async fn handle_cancel(
     State(state): State<ServerState>,
-    Query(query): Query<CancelQuery>,
+    Query(query): Query<HashMap<String, String>>,
+    body: String,
 ) -> StatusCode {
+    let session_id = query
+        .get("sessionId")
+        .or_else(|| query.get("session_id"))
+        .cloned()
+        .or_else(|| {
+            if !body.is_empty() {
+                serde_json::from_str::<serde_json::Value>(&body)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("sessionId")
+                            .or_else(|| v.get("session_id"))
+                            .and_then(|s| s.as_str())
+                            .map(|s| s.to_string())
+                    })
+            } else {
+                None
+            }
+        });
+
+    let mut sessions = state.active_sessions.lock().unwrap();
+    if let Some(id) = session_id {
+        sessions.remove(&id);
+        let _ = state.event_tx.send(AppEvent::TransferFailed {
+            session_id: id,
+            error: "Transfer cancelled by sender".to_string(),
+        });
+    } else {
+        let keys: Vec<_> = sessions.keys().cloned().collect();
+        for id in keys {
+            sessions.remove(&id);
+            let _ = state.event_tx.send(AppEvent::TransferFailed {
+                session_id: id,
+                error: "Transfer cancelled by sender".to_string(),
+            });
+        }
+    }
+    StatusCode::OK
+}
+
+async fn handle_prepare_download(
+    State(state): State<ServerState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let session_id = query
+        .get("sessionId")
+        .or_else(|| query.get("session_id"))
+        .cloned()
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+
+    let mut session_files = HashMap::new();
+    let mut files_dto = HashMap::new();
+
+    let active_dir = state.download_dir.lock().unwrap().clone();
+    if let Ok(mut entries) = tokio::fs::read_dir(&active_dir).await {
+        let mut count = 0;
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            if count >= 50 {
+                break;
+            }
+            let metadata = match entry.metadata().await {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if metadata.is_file() {
+                let file_name = entry.file_name().to_string_lossy().to_string();
+                let file_id = format!("file-{}", count);
+                let size = metadata.len();
+                session_files.insert(file_id.clone(), (file_name.clone(), size));
+
+                files_dto.insert(
+                    file_id.clone(),
+                    serde_json::json!({
+                        "id": file_id,
+                        "fileName": file_name,
+                        "size": size,
+                        "fileType": "application/octet-stream"
+                    }),
+                );
+                count += 1;
+            }
+        }
+    }
+
+    let session = ActiveSession {
+        files: session_files,
+        tokens: HashMap::new(),
+    };
+
     state
         .active_sessions
         .lock()
         .unwrap()
-        .remove(&query.session_id);
-    let _ = state.event_tx.send(AppEvent::TransferFailed {
-        session_id: query.session_id,
-        error: "Transfer cancelled by sender".to_string(),
-    });
-    StatusCode::OK
+        .insert(session_id.clone(), session);
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "info": {
+                "alias": state.alias,
+                "version": PROTOCOL_VERSION,
+                "deviceModel": "vib TUI Client",
+                "deviceType": "desktop",
+                "fingerprint": state.fingerprint,
+                "download": true
+            },
+            "sessionId": session_id,
+            "files": files_dto
+        })),
+    )
 }
