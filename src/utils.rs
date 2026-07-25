@@ -1,5 +1,8 @@
+//! Helper functions for formatting bytes, file sizes, and time durations.
+
 use std::time::SystemTime;
 
+/// Formats a byte count into a human-readable string (B, KB, MB, GB).
 pub fn format_size(size: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = KB * 1024;
@@ -12,16 +15,17 @@ pub fn format_size(size: u64) -> String {
     } else if size >= KB {
         format!("{:.2} KB", size as f64 / KB as f64)
     } else {
-        format!("{} B", size)
+        format!("{size} B")
     }
 }
 
+/// Formats a `SystemTime` instance into a human-readable relative time string.
 pub fn format_modified_time(modified: SystemTime) -> Option<String> {
     let duration = modified.elapsed().ok()?;
     let secs = duration.as_secs();
 
     let s = if secs < 60 {
-        format!("{} seconds ago", secs)
+        format!("{secs} seconds ago")
     } else if secs < 3600 {
         format!("{} minutes ago", secs / 60)
     } else if secs < 86400 {
@@ -31,4 +35,17 @@ pub fn format_modified_time(modified: SystemTime) -> Option<String> {
     };
 
     Some(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_format_size() {
+        assert_eq!(format_size(500), "500 B");
+        assert_eq!(format_size(1024), "1.00 KB");
+        assert_eq!(format_size(1572864), "1.50 MB");
+        assert_eq!(format_size(2147483648), "2.00 GB");
+    }
 }
