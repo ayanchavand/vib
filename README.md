@@ -6,6 +6,10 @@
 
 A terminal file browser with LocalSend built in. Manage, organize, and move files around your machine, then send or receive them across your devices without leaving the terminal.
 
+![vib Main Interface](assets/img1.png)
+
+![LocalSend Overlay Hub](assets/img2.png)
+
 ---
 
 ## Features
