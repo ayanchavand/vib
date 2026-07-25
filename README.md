@@ -1,93 +1,88 @@
-# `vib-send` • LocalSend TUI Client & File Browser
+# vib-send
 
-`vib-send` is a fast, terminal-based file browser and cross-platform **LocalSend Protocol (v2.1)** client built with Rust and [Ratatui](https://github.com/ratatui/ratatui).
+[![Built With Ratatui](https://ratatui.rs/built-with-ratatui/badge.svg)](https://ratatui.rs/)
 
-It allows you to navigate local file systems, tag multiple files/folders, discover nearby LocalSend devices (Android, iOS, macOS, Windows, Linux), and seamlessly send or receive files over your local Wi-Fi / Ethernet network without third-party cloud servers.
+![GitHub Release](https://img.shields.io/github/v/release/ayanchavand/vib?style=for-the-badge)
+![Last Commit](https://img.shields.io/github/last-commit/ayanchavand/vib?style=for-the-badge)
+
+A terminal-based file browser and cross-platform LocalSend Protocol (v2.1) client. Navigate your file system, tag files or folders, discover nearby LocalSend devices, and send or receive files over your local network without a cloud server.
 
 ---
 
 ## Features
 
-- 📂 **Full TUI File Browser**: Fast navigation, file metadata preview, visual directory tree.
-- 📡 **Automatic LocalSend Peer Discovery**: Listens and announces on UDP multicast (`224.0.0.167:53317`) and broadcast networks.
-- 📥 **Interactive Receive Queue**: Dedicated incoming transfer tab with file previews, `[y] Accept` and `[n] Decline` options.
-- ⚡ **Real-Time Transfer Progress**: Live progress bars showing upload/download speeds and total bytes transferred.
-- 🔒 **Secure Local Encryption**: Dynamic self-signed X.509 TLS certificate generation with SHA-256 fingerprint verification.
-- 🌐 **Multi-Interface Support**: Handles complex network setups (Docker bridges, Tailscale, VPNs) by binding across all active IPv4 interfaces (`wlan0`, `eth0`).
+- Full TUI file browser with fast navigation and metadata preview
+- Automatic LocalSend peer discovery over UDP multicast (`224.0.0.167:53317`) and broadcast
+- Interactive receive queue with file previews, accept/decline actions
+- Real-time transfer progress with speed and byte counts
+- Self-signed X.509 TLS certificate generation with SHA-256 fingerprint verification
+- Multi-interface support (Docker bridges, Tailscale, VPNs), binding across all active IPv4 interfaces
 
 ---
 
-## Keyboard Shortcuts & Controls
+## Keyboard Shortcuts
 
 | Key | Action |
-| --- | --- |
-| `L` / `Shift+L` | **Toggle View Mode**: Switch between **Default File Explorer Mode** and **LocalSend UI Mode** |
-| `Tab` / `Shift+Tab` | Switch between LocalSend tabs (`[1] Files`, `[2] Peers`, `[3] Receive`, `[4] Transfers`, `[5] Settings`) |
-| `Space` | Tag / Untag highlighted file or directory for sending |
-| `v` | Tag / Untag **all** items in current directory |
-| `s` | Open **Send Modal** to select destination device for tagged files |
-| `r` / `R` | Manually trigger a **Network Scan / Rescan** for LocalSend devices |
-| `y` / `Enter` | **Accept** selected incoming file transfer (saves to `~/Downloads`) |
-| `n` / `d` | **Decline** selected incoming file transfer |
-| `Up` / `Down` / `k` / `j` | Navigate lists & file items |
-| `Enter` / `l` / `Right` | Open directory / Select peer |
-| `Backspace` / `h` / `Left` | Go up one directory level |
-| `q` / `Ctrl+C` | Exit application |
-
----
-
-## Common Hiccups & Troubleshooting
-
-### 1. Device Discovery Issues / Mobile Phone Not Appearing
-
-If your phone or another LocalSend app does not appear in the **`[2] Peers 📡`** tab, check the following:
-
-#### A. Linux Firewall (UFW / FirewallD / iptables)
-Linux firewalls often block incoming UDP and TCP traffic on port `53317` by default.
-
-- **UFW (Ubuntu / Debian / Mint)**:
-  ```bash
-  sudo ufw allow 53317/tcp
-  sudo ufw allow 53317/udp
-  ```
-
-- **FirewallD (Fedora / RHEL / Arch / CentOS)**:
-  ```bash
-  sudo firewall-cmd --add-port=53317/tcp --permanent
-  sudo firewall-cmd --add-port=53317/udp --permanent
-  sudo firewall-cmd --reload
-  ```
-
-- **iptables**:
-  ```bash
-  sudo iptables -A INPUT -p tcp --dport 53317 -j ACCEPT
-  sudo iptables -A INPUT -p udp --dport 53317 -j ACCEPT
-  ```
-
-#### B. Multiple Network Interfaces (Docker, Tailscale, VPNs)
-If Docker or Tailscale is active on your system, UDP multicast traffic may get routed to virtual network bridges (`docker0`, `tailscale0`) instead of your local Wi-Fi (`wlan0`).
-- Press **`r`** inside `vib-send` to force a multi-interface subnet broadcast scan.
-- Ensure both your computer and phone are connected to the same Wi-Fi access point.
-
-#### C. Mobile App "Waiting for response..."
-LocalSend requires manual confirmation by default. When a phone initiates a file transfer, `vib-send` will automatically switch to the **`[3] Receive 📥`** tab. Press **`y`** on your keyboard to accept and start the download.
+|---|---|
+| `L` / `Shift+L` | Toggle between File Explorer mode and LocalSend UI mode |
+| `Tab` / `Shift+Tab` | Switch tabs (`Files`, `Peers`, `Receive`, `Transfers`, `Settings`) |
+| `Space` | Tag / untag highlighted file or directory |
+| `v` | Tag / untag all items in current directory |
+| `s` | Open send modal to choose a destination device |
+| `r` / `R` | Rescan network for LocalSend devices |
+| `y` / `Enter` | Accept incoming transfer (saves to `~/Downloads`) |
+| `n` / `d` | Decline incoming transfer |
+| `Up` / `Down` / `k` / `j` | Navigate lists |
+| `Enter` / `l` / `Right` | Open directory / select peer |
+| `Backspace` / `h` / `Left` | Go up one directory |
+| `q` / `Ctrl+C` | Exit |
 
 ---
 
 ## Building from Source
 
-### Prerequisites
-- Rust 1.80+ (`cargo` and `rustc`)
+Requires [Rust](https://rustup.rs/) 1.80+.
 
-### Build & Run
 ```bash
-# Clone the repository
 git clone https://github.com/ayanchavand/vib.git
 cd vib
-
-# Check and build
 cargo build --release
-
-# Run the TUI client
 ./target/release/vib
 ```
+
+---
+
+## Troubleshooting
+
+### Device not appearing in Peers
+
+**Linux firewall.** Port `53317` is often blocked by default.
+
+- UFW:
+  ```bash
+  sudo ufw allow 53317/tcp
+  sudo ufw allow 53317/udp
+  ```
+- FirewallD:
+  ```bash
+  sudo firewall-cmd --add-port=53317/tcp --permanent
+  sudo firewall-cmd --add-port=53317/udp --permanent
+  sudo firewall-cmd --reload
+  ```
+- iptables:
+  ```bash
+  sudo iptables -A INPUT -p tcp --dport 53317 -j ACCEPT
+  sudo iptables -A INPUT -p udp --dport 53317 -j ACCEPT
+  ```
+
+**Multiple network interfaces.** Docker or Tailscale can route multicast traffic to a virtual bridge (`docker0`, `tailscale0`) instead of Wi-Fi (`wlan0`). Press `r` to force a multi-interface subnet scan, and confirm both devices are on the same access point.
+
+### Phone stuck on "Waiting for response..."
+
+LocalSend requires manual confirmation. When a transfer is initiated, `vib-send` switches to the `Receive` tab automatically — press `y` to accept.
+
+---
+
+## License
+
+MIT
