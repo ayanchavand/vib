@@ -26,6 +26,7 @@ impl DiscoveryEngine {
         port: u16,
         event_tx: UnboundedSender<AppEvent>,
     ) -> Self {
+        // LocalSend v2 protocol uses self-signed TLS certificates for P2P transfers
         let http_client = Client::builder()
             .danger_accept_invalid_certs(true)
             .build()
