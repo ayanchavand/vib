@@ -84,6 +84,18 @@ A terminal file browser with LocalSend built in. Manage, organize, and move file
 
 ---
 
+## Installation
+
+### From Crates.io
+
+```bash
+cargo install vib --version 0.1.0-beta.1
+# or
+cargo install vib --prerelease
+```
+
+---
+
 ## Building from Source
 
 Requires [Rust](https://rustup.rs/) 1.80+.
