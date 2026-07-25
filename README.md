@@ -1,22 +1,19 @@
-# vib-send
+# vib
 
 [![Built With Ratatui](https://ratatui.rs/built-with-ratatui/badge.svg)](https://ratatui.rs/)
 
 ![GitHub Release](https://img.shields.io/github/v/release/ayanchavand/vib?style=for-the-badge)
 ![Last Commit](https://img.shields.io/github/last-commit/ayanchavand/vib?style=for-the-badge)
 
-A terminal-based file browser and cross-platform LocalSend Protocol (v2.1) client. Navigate your file system, tag files or folders, discover nearby LocalSend devices, and send or receive files over your local network without a cloud server.
+A terminal file browser with LocalSend built in. Manage, organize, and move files around your machine, then send or receive them across your other devices without ever leaving the terminal.
 
----
-
-## Features
-
-- Full TUI file browser with fast navigation and metadata preview
-- Automatic LocalSend peer discovery over UDP multicast (`224.0.0.167:53317`) and broadcast
-- Interactive receive queue with file previews, accept/decline actions
-- Real-time transfer progress with speed and byte counts
-- Self-signed X.509 TLS certificate generation with SHA-256 fingerprint verification
-- Multi-interface support (Docker bridges, Tailscale, VPNs), binding across all active IPv4 interfaces
+- Dual-pane browsing, each pane its own tab
+- Bookmark directories for quick access
+- Send and receive files via LocalSend without leaving vib
+- Cut, copy, paste, create folders, and rename files or folders
+- Multi-select for cut, copy, or send via LocalSend
+- Text file preview
+- Catppuccin-themed UI, built for ricing
 
 ---
 
@@ -24,17 +21,24 @@ A terminal-based file browser and cross-platform LocalSend Protocol (v2.1) clien
 
 | Key | Action |
 |---|---|
-| `L` / `Shift+L` | Toggle between File Explorer mode and LocalSend UI mode |
-| `Tab` / `Shift+Tab` | Switch tabs (`Files`, `Peers`, `Receive`, `Transfers`, `Settings`) |
-| `Space` | Tag / untag highlighted file or directory |
-| `v` | Tag / untag all items in current directory |
-| `s` | Open send modal to choose a destination device |
-| `r` / `R` | Rescan network for LocalSend devices |
-| `y` / `Enter` | Accept incoming transfer (saves to `~/Downloads`) |
-| `n` / `d` | Decline incoming transfer |
-| `Up` / `Down` / `k` / `j` | Navigate lists |
-| `Enter` / `l` / `Right` | Open directory / select peer |
+| `Tab` / `Shift+Tab` | Switch between dual panes |
+| `Up` / `Down` / `k` / `j` | Navigate the current pane |
+| `Enter` / `l` / `Right` | Open directory |
 | `Backspace` / `h` / `Left` | Go up one directory |
+| `Space` | Select / deselect highlighted file or directory |
+| `v` | Select / deselect all items in current directory |
+| `b` | Bookmark current directory |
+| `B` | Jump to a bookmarked directory |
+| `x` | Cut selected item(s) |
+| `c` | Copy selected item(s) |
+| `p` | Paste |
+| `n` | Create new folder |
+| `R` | Rename file or folder |
+| `Space` (preview pane) | Toggle text preview of highlighted file |
+| `s` | Send selected item(s) via LocalSend |
+| `r` | Rescan network for LocalSend devices |
+| `y` / `Enter` | Accept incoming LocalSend transfer (saves to `~/Downloads`) |
+| `d` | Decline incoming LocalSend transfer |
 | `q` / `Ctrl+C` | Exit |
 
 ---
@@ -54,7 +58,7 @@ cargo build --release
 
 ## Troubleshooting
 
-### Device not appearing in Peers
+### Device not appearing during send
 
 **Linux firewall.** Port `53317` is often blocked by default.
 
@@ -79,7 +83,7 @@ cargo build --release
 
 ### Phone stuck on "Waiting for response..."
 
-LocalSend requires manual confirmation. When a transfer is initiated, `vib-send` switches to the `Receive` tab automatically — press `y` to accept.
+LocalSend requires manual confirmation. When a transfer is initiated, `vib` prompts you automatically — press `y` to accept.
 
 ---
 
