@@ -196,6 +196,7 @@ impl DiscoveryEngine {
     }
 }
 
+#[cfg(unix)]
 pub fn get_local_v4_ips() -> Vec<Ipv4Addr> {
     let mut ips = Vec::new();
     unsafe {
@@ -215,6 +216,23 @@ pub fn get_local_v4_ips() -> Vec<Ipv4Addr> {
                 curr = (*curr).ifa_next;
             }
             libc::freeifaddrs(ifap);
+        }
+    }
+    ips
+}
+
+#[cfg(not(unix))]
+pub fn get_local_v4_ips() -> Vec<Ipv4Addr> {
+    let mut ips = Vec::new();
+    if let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") {
+        if socket.connect("8.8.8.8:80").is_ok() {
+            if let Ok(local_addr) = socket.local_addr() {
+                if let std::net::IpAddr::V4(ipv4) = local_addr.ip() {
+                    if !ipv4.is_loopback() {
+                        ips.push(ipv4);
+                    }
+                }
+            }
         }
     }
     ips
