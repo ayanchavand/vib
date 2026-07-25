@@ -1,6 +1,7 @@
 # vib
 
 [![Built With Ratatui](https://ratatui.rs/built-with-ratatui/badge.svg)](https://ratatui.rs/)
+[![Crates.io Version](https://img.shields.io/crates/v/vib?style=for-the-badge)](https://crates.io/crates/vib)
 ![GitHub Release](https://img.shields.io/github/v/release/ayanchavand/vib?style=for-the-badge)
 ![Last Commit](https://img.shields.io/github/last-commit/ayanchavand/vib?style=for-the-badge)
 
